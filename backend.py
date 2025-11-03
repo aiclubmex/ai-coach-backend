@@ -23,7 +23,11 @@ NOTION_API_KEY = os.environ.get('NOTION_API_KEY')
 NOTION_DATABASE_ID = os.environ.get('NOTION_DATABASE_ID')  # Tu database de problemas
 
 # Inicializar clientes
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+claude_client = anthropic.Anthropic(
+    api_key=ANTHROPIC_API_KEY,
+    max_retries=2,
+    timeout=60.0
+)
 notion_client = Client(auth=NOTION_API_KEY)
 
 # ============================================

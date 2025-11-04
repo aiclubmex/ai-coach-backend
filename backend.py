@@ -274,4 +274,133 @@ def check():
 
 # Nota: en Render usa el comando de inicio:  gunicorn backend:app
 # ===============================================================================
+# ====== STEP-BY-STEP ENGINE (añadir al final de backend.py) ==================
+from functools import lru_cache
+
+STEPS_SYSTEM = (
+    "You are a physics tutor. Break the verified full solution into small steps "
+    "(2-10). Each step should be a single actionable move. If a step expects a "
+    "numeric result, include expected_value (float), tolerance_pct (e.g., 1.0 for 1%), "
+    "and expected_units if relevant. Keep JSON concise."
+)
+
+def _safe_float(x):
+    try:
+        return float(x)
+    except:
+        return None
+
+@lru_cache(maxsize=256)
+def plan_steps_for(page_id:str):
+    """Genera y cachea los pasos para un problema (en memoria)."""
+    notion = get_notion()
+    page = notion.pages.retrieve(page_id=page_id)
+    props = page.get("properties", {})
+    title = get_prop_text(props, ["Name","name"])
+    statement = get_prop_text(props, ["problem_statement"])
+    given = get_prop_text(props, ["given_values"])
+    fin = get_prop_text(props, ["final_answer"])
+    solution = get_prop_text(props, ["full_solution"])
+
+    client = get_claude()
+    msg = client.messages.create(
+        model="claude-3-5-sonnet-20240620",
+        max_tokens=800,
+        system=STEPS_SYSTEM,
+        messages=[{
+          "role":"user",
+          "content":(
+            "Return ONLY valid JSON with this schema:\n"
+            "{ \"steps\": [\n"
+            "  {\"title\": str, \"instruction\": str, "
+            "\"expects_numeric\": bool, "
+            "\"expected_value\": number|null, \"tolerance_pct\": number|null, "
+            "\"expected_units\": str|null }\n"
+            "]}\n\n"
+            f"Problem: {title}\nStatement: {statement}\nGiven: {given}\n"
+            f"Verified final answer: {fin}\nFull solution:\n{solution}\n"
+            "Make steps minimal and student-friendly."
+          )
+        }]
+    )
+    text = "".join([p.text for p in msg.content if getattr(p,"type","")=="text"]).strip()
+    import json
+    try:
+        data = json.loads(text)
+        steps = data.get("steps", [])
+    except Exception:
+        steps = [{"title":"Start","instruction":"State knowns and what is required.","expects_numeric":False,
+                  "expected_value":None,"tolerance_pct":None,"expected_units":None}]
+    # Sanea tipos
+    cleaned = []
+    for s in steps:
+        cleaned.append({
+            "title": str(s.get("title","Step")),
+            "instruction": str(s.get("instruction","")),
+            "expects_numeric": bool(s.get("expects_numeric", False)),
+            "expected_value": _safe_float(s.get("expected_value")) if s.get("expected_value") is not None else None,
+            "tolerance_pct": _safe_float(s.get("tolerance_pct")) if s.get("tolerance_pct") is not None else None,
+            "expected_units": (s.get("expected_units") or None)
+        })
+    return cleaned
+
+@app.get("/steps/<page_id>")
+def get_steps(page_id):
+    """Devuelve el plan de pasos para renderizar el modo 'Tutor lidera'."""
+    steps = plan_steps_for(page_id)
+    return jsonify({"steps": steps, "count": len(steps)})
+
+@app.post("/grade_step")
+def grade_step():
+    """Valida el trabajo del paso actual. Si no es numérico, usa evaluación semántica breve."""
+    data = request.get_json(silent=True) or {}
+    page_id = data.get("problemId")
+    idx = int(data.get("stepIndex", 0))
+    student = (data.get("work") or "").strip()
+    if not page_id:
+        return jsonify({"error":"Missing problemId"}), 400
+
+    steps = plan_steps_for(page_id)
+    if idx<0 or idx>=len(steps):
+        return jsonify({"error":"Invalid step index"}), 400
+    step = steps[idx]
+
+    # Numérico con tolerancia
+    if step.get("expects_numeric"):
+        stu_val, stu_units = extract_number_and_units(student)
+        exp_val = step.get("expected_value")
+        tol_pct = step.get("tolerance_pct") or 1.0  # % por defecto
+        exp_units = (step.get("expected_units") or "").strip().lower() or None
+        if stu_val is None or exp_val is None:
+            # caemos a evaluación textual
+            pass
+        else:
+            tol = abs(exp_val)*tol_pct/100.0
+            numeric_ok = abs(stu_val - exp_val) <= max(tol, 1e-9)
+            units_ok = (not exp_units) or ((stu_units or "").strip().lower()==exp_units)
+            ok = numeric_ok and units_ok
+            fb = "✅ Paso correcto" if ok else f"❌ Revisa: esperado≈ {exp_val:g} {exp_units or ''} (±{tol_pct}%)."
+            return jsonify({"correct": ok, "feedback": fb})
+
+    # Semántico/explicativo
+    client = get_claude()
+    msg = client.messages.create(
+        model="claude-3-5-sonnet-20240620",
+        max_tokens=220,
+        system=SYSTEM_PROMPT,
+        messages=[{
+          "role":"user",
+          "content":(
+            "Judge if the student's work fulfills THIS step only. "
+            "Reply 'CORRECT' or 'INCORRECT' and one short line of actionable feedback.\n"
+            f"Step instruction: {step.get('instruction')}\n"
+            f"Student work: {student}"
+          )
+        }]
+    )
+    text = "".join([p.text for p in msg.content if getattr(p,"type","")=="text"])
+    verdict = "CORRECT" in text.upper()
+    fb = ("✅ Paso correcto" if verdict else "❌ Aún no") + " — " + text.strip()
+    return jsonify({"correct": verdict, "feedback": fb})
+# ============================================================================ 
 

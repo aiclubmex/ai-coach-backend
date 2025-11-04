@@ -21,6 +21,16 @@ CORS(app)  # Permite requests desde tu landing page
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 NOTION_API_KEY = os.environ.get('NOTION_API_KEY')
 NOTION_DATABASE_ID = os.environ.get('NOTION_DATABASE_ID')  # Tu database de problemas
+24
+25  # Limpiar variables de proxy que Render inyecta automáticamente
+26  import os
+27  os.environ.pop('HTTP_PROXY', None)
+28  os.environ.pop('HTTPS_PROXY', None)
+29  os.environ.pop('http_proxy', None)
+30  os.environ.pop('https_proxy', None)
+31
+32  # Inicializar clientes
+33  claude_client = anthropic.Anthropic(
 
 # Inicializar clientes
 claude_client = anthropic.Anthropic(

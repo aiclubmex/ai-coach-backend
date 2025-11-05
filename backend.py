@@ -1,14 +1,10 @@
 # backend.py
 # Flask API for Physics AI Coach
-# - GET  /                 -> health
-# - GET  /problems         -> list problems from Notion (id, name, difficulty)
-# - GET  /problem/<id>     -> full problem detail
-# - GET  /problem?id=...   -> alias for the above
-# - GET  /problems/<id>    -> alias for the above
-# - GET  /steps/<id>       -> step-by-step plan (from Notion or auto-generated)
-# - POST /generate-steps   -> alias that returns {"steps":[...]} from id
-# - POST /chat             -> evaluate a student's step / give hint
-# - POST /check-step       -> alias that forwards to /chat
+# - GET /               -> health
+# - GET /problems       -> list problems from Notion (lightweight)
+# - GET /problem/<id>   -> full problem
+# - GET /steps/<id>     -> step plan (from Notion or auto-generated). Nunca 500.
+# - POST /chat          -> evalúa el paso del alumno y da feedback/siguiente pista
 
 import os, re, json
 from typing import List, Dict, Any
@@ -20,14 +16,15 @@ import requests
 NOTION_API_KEY    = os.environ.get("NOTION_API_KEY", "")
 NOTION_DB_ID      = os.environ.get("NOTION_DATABASE_ID", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-FRONTEND_ORIGIN   = os.environ.get("FRONTEND_ORIGIN")  # e.g., https://aiclub.com.mx
+FRONTEND_ORIGIN   = os.environ.get("FRONTEND_ORIGIN")  # ej: https://aiclub.com.mx
 
 # ---------- Flask ----------
 app = Flask(__name__)
 if FRONTEND_ORIGIN:
     CORS(app, resources={r"/*": {"origins": [FRONTEND_ORIGIN]}})
 else:
-    CORS(app)  # dev: allow all
+    # desarrollo: permitir todos (puedes endurecerlo luego)
+    CORS(app)
 
 # ---------- Notion helpers ----------
 NOTION_BASE = "https://api.notion.com/v1"
@@ -56,15 +53,15 @@ def _get_prop(props: Dict[str, Any], key: str) -> str:
     if t == "rich_text":
         return _rt_to_plain(p.get("rich_text"))
     if t == "select":
-        sel = p.get("select")
-        return (sel or {}).get("name", "") if sel else ""
+        sl = p.get("select")
+        return (sl or {}).get("name", "") if sl else ""
     if t == "multi_select":
-        return ", ".join([x.get("name", "") for x in p.get("multi_select", [])])
+        return ", ".join([x.get("name","") for x in p.get("multi_select", [])])
     return ""
 
 def fetch_problems() -> List[Dict[str, Any]]:
     url = f"{NOTION_BASE}/databases/{NOTION_DB_ID}/query"
-    out: List[Dict[str, Any]] = []
+    acc: List[Dict[str, Any]] = []
     payload = {"page_size": 100}
     while True:
         r = requests.post(url, headers=NOTION_HEADERS, data=json.dumps(payload))
@@ -72,29 +69,19 @@ def fetch_problems() -> List[Dict[str, Any]]:
         data = r.json()
         for page in data.get("results", []):
             props = page.get("properties", {})
-            out.append({
+            acc.append({
                 "id": page.get("id"),
                 "name": _get_prop(props, "Name") or _get_prop(props, "name") or "Untitled",
                 "difficulty": _get_prop(props, "difficulty") or _get_prop(props, "Difficulty"),
-                "problem_statement": _get_prop(props, "problem_statement"),
-                "given_values": _get_prop(props, "given_values"),
-                "find": _get_prop(props, "find"),
-                "key_concepts": _get_prop(props, "key_concepts"),
-                "common_mistakes": _get_prop(props, "common_mistakes"),
-                "final_answer": _get_prop(props, "final_answer"),
-                "step_by_step": _get_prop(props, "step_by_step"),
             })
-        if not data.get("has_more"):
-            break
+        if not data.get("has_more"): break
         payload["start_cursor"] = data.get("next_cursor")
-    return out
+    return acc
 
 def fetch_page(page_id: str) -> Dict[str, Any]:
     url = f"{NOTION_BASE}/pages/{page_id}"
-    r = requests.get(url, headers=NOTION_HEADERS)
-    r.raise_for_status()
-    page = r.json()
-    props = page.get("properties", {})
+    r = requests.get(url, headers=NOTION_HEADERS); r.raise_for_status()
+    page = r.json(); props = page.get("properties", {})
     return {
         "id": page.get("id"),
         "name": _get_prop(props, "Name") or _get_prop(props, "name") or "Untitled",
@@ -108,46 +95,45 @@ def fetch_page(page_id: str) -> Dict[str, Any]:
         "step_by_step": _get_prop(props, "step_by_step"),
     }
 
-# ---------- Steps ----------
+# ---------- Steps parsing / generation ----------
 STEP_RE = re.compile(r"^\s*(\d+)[\).:-]\s*(.+)$")
 
 def parse_steps(raw: str) -> List[Dict[str, str]]:
     steps: List[Dict[str, str]] = []
-    if not raw:
-        return steps
+    if not raw: return steps
     for line in raw.splitlines():
         line = line.strip()
-        if not line:
-            continue
+        if not line: continue
         m = STEP_RE.match(line)
         if m:
-            sid = m.group(1)
-            rest = m.group(2)
+            sid, rest = m.group(1), m.group(2)
             rubric = ""
             if "| rubric:" in rest:
                 part, rub = rest.split("| rubric:", 1)
-                text = part.strip()
-                rubric = rub.strip()
+                text = part.strip(); rubric = rub.strip()
             else:
                 text = rest.strip()
             steps.append({"id": sid, "text": text, "rubric": rubric})
     if not steps and raw.strip():
-        steps.append({"id": "1", "text": raw.strip(), "rubric": ""})
+        steps.append({"id":"1","text":raw.strip(),"rubric":""})
     return steps
 
 def anthropic_client():
     from anthropic import Anthropic
     return Anthropic(api_key=ANTHROPIC_API_KEY)
 
+ANTHROPIC_MODEL = "claude-3-5-sonnet-latest"  # robusto; evita 404 por alias viejo
+
 def generate_steps_with_llm(problem: Dict[str, Any]) -> List[Dict[str, str]]:
     if not ANTHROPIC_API_KEY:
         return []
-    client = anthropic_client()
-    prompt = f"""
-You are a patient IB Physics tutor. Break this problem into 4–6 small steps.
-Each step is an action the student should do next.
-Append a short grading rubric after a pipe: " | rubric: ...".
-Return plain text lines like:
+    try:
+        client = anthropic_client()
+        prompt = f"""
+You are a patient IB Physics tutor. Break this problem into 4–6 short steps.
+Each step: one concrete action. After it add ' | rubric: ...' with what to check.
+Return plain text lines ONLY:
+
 1) ...
 2) ...
 3) ...
@@ -158,17 +144,20 @@ Given: {problem.get('given_values')}
 Find: {problem.get('find')}
 Key concepts: {problem.get('key_concepts')}
 """
-    msg = client.messages.create(
-        model="claude-3-5-sonnet-20240620",
-        max_tokens=500,
-        temperature=0.2,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = ""
-    for b in msg.content:
-        if getattr(b, "type", "") == "text":
-            text += b.text
-    return parse_steps(text)
+        msg = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=500,
+            temperature=0.2,
+            messages=[{"role":"user","content":prompt}]
+        )
+        text = ""
+        for b in msg.content:
+            if getattr(b, "type", "") == "text":
+                text += b.text
+        return parse_steps(text)
+    except Exception:
+        # Nunca tumbar el endpoint por fallas del proveedor
+        return []
 
 # ---------- Routes ----------
 @app.get("/")
@@ -178,68 +167,78 @@ def health():
 @app.get("/problems")
 def problems():
     try:
-        items = fetch_problems()
-        simplified = [{"id": p["id"], "name": p["name"], "difficulty": p["difficulty"]} for p in items]
-        return jsonify({"problems": simplified})
+        return jsonify({"problems": fetch_problems()})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.get("/problem/<page_id>")
 def problem_detail(page_id):
     try:
-        p = fetch_page(page_id)
-        return jsonify({"problem": p})
+        return jsonify({"problem": fetch_page(page_id)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.get("/steps/<page_id>")
 def steps(page_id):
+    """
+    Devuelve siempre 200 con el plan (aunque sea [] si no se pudo generar).
+    Frontend puede mostrar “No steps generated yet”.
+    """
+    info = {"mode": "tutor", "steps": [], "note": ""}
     try:
         p = fetch_page(page_id)
-        raw = p.get("step_by_step", "")
-        steps_list = parse_steps(raw)
-        if not steps_list:
-            steps_list = generate_steps_with_llm(p)
-        return jsonify({"mode": "tutor", "steps": steps_list})
+        raw = p.get("step_by_step","")
+        s = parse_steps(raw)
+        if not s:
+            s = generate_steps_with_llm(p)
+            if not s:
+                info["note"] = "Could not auto-generate steps (LLM unavailable or model not enabled)."
+        info["steps"] = s
+        return jsonify(info)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Última defensa: tampoco 500 aquí
+        info["note"] = f"Error reading steps: {e}"
+        return jsonify(info)
 
 @app.post("/chat")
 def chat():
+    """
+    Body:
+    {
+      "problem_id": "...", "step_id": "1",
+      "student_answer": "text", "mode": "tutor"|"student"
+    }
+    """
     data = request.get_json(force=True, silent=True) or {}
     problem_id = data.get("problem_id")
-    step_id = str(data.get("step_id") or "")
-    student_answer = data.get("student_answer", "").strip()
-    mode = data.get("mode", "tutor")
+    step_id = str(data.get("step_id") or "1")
+    student_answer = (data.get("student_answer") or "").strip()
 
     if not problem_id:
-        return jsonify({"error": "missing problem_id"}), 400
+        return jsonify({"error":"missing problem_id"}), 400
 
     p = fetch_page(problem_id)
-    steps_list = parse_steps(p.get("step_by_step", ""))
-    if not steps_list:
-        steps_list = generate_steps_with_llm(p)
+    steps_list = parse_steps(p.get("step_by_step","")) or generate_steps_with_llm(p)
 
     current = None
     for s in steps_list:
-        if s["id"] == step_id:
-            current = s
-            break
+        if s.get("id") == step_id:
+            current = s; break
     if not current and steps_list:
         current = steps_list[0]
         step_id = current["id"]
 
     if not ANTHROPIC_API_KEY:
         return jsonify({
-            "feedback": "(No LLM) Answer received.",
-            "ok": True,
-            "next_step": str(int(step_id) + 1) if step_id.isdigit() else "",
-            "message": "Move to the next step.",
+            "ok": True, "feedback":"(No LLM) Answer received.",
+            "next_step": str(int(step_id)+1) if step_id.isdigit() else "",
+            "message":"Move to the next step."
         })
 
-    rub = current.get("rubric", "")
+    # Construir prompt
+    rub = (current or {}).get("rubric","")
     eval_prompt = f"""
-You are an IB Physics tutor. Evaluate the student's response JUST for this step.
+You are an IB Physics tutor. Evaluate the student's response for this step.
 
 Problem (short):
 Statement: {p.get('problem_statement')}
@@ -247,92 +246,51 @@ Given: {p.get('given_values')}
 Find: {p.get('find')}
 
 Current step {step_id}:
-"{current.get('text')}"
-
+"{(current or {}).get('text','')}"
 Grading rubric (if any): {rub or "(none)"}
 
 Student answer:
 \"\"\"{student_answer}\"\"\"
 
-Return compact JSON:
-{{"ok": true/false, "feedback": "...", "next_hint": "...", "ready_to_advance": true/false}}
+Return JSON ONLY with keys:
+ok (true/false), feedback (string), next_hint (string), ready_to_advance (true/false)
 """
 
-    client = anthropic_client()
-    msg = client.messages.create(
-        model="claude-3-5-sonnet-20240620",
-        max_tokens=400,
-        temperature=0.2,
-        messages=[{"role": "user", "content": eval_prompt}],
-    )
-    text = ""
-    for b in msg.content:
-        if getattr(b, "type", "") == "text":
-            text += b.text
-
     try:
-        parsed = json.loads(text.strip())
-    except Exception:
-        parsed = {"ok": False, "feedback": text, "ready_to_advance": False, "next_hint": ""}
+        client = anthropic_client()
+        msg = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=400,
+            temperature=0.2,
+            messages=[{"role":"user","content":eval_prompt}]
+        )
+        text = ""
+        for b in msg.content:
+            if getattr(b, "type", "") == "text":
+                text += b.text
+        try:
+            parsed = json.loads(text.strip())
+        except Exception:
+            parsed = {"ok": False, "feedback": text, "ready_to_advance": False, "next_hint": ""}
 
-    advance = parsed.get("ready_to_advance") or parsed.get("ok")
-    next_step = str(int(step_id) + 1) if (advance and step_id.isdigit()) else step_id
-    message = parsed.get("next_hint") if not advance else "Great! Let's go on."
+        advance = parsed.get("ready_to_advance") or parsed.get("ok")
+        next_step = str(int(step_id) + 1) if (advance and step_id.isdigit()) else step_id
+        message = parsed.get("next_hint") if not advance else "Great! Let's go on."
 
-    return jsonify({
-        "ok": bool(parsed.get("ok") or parsed.get("ready_to_advance")),
-        "feedback": parsed.get("feedback", ""),
-        "next_step": next_step,
-        "message": message,
-    })
-
-# ---------- Front aliases (for your WordPress page) ----------
-@app.get("/problem")
-def problem_detail_query():
-    pid = request.args.get("id")
-    if not pid:
-        return jsonify({"error": "missing id"}), 400
-    try:
-        p = fetch_page(pid)
-        return jsonify({"problem": p})
+        return jsonify({
+            "ok": bool(parsed.get("ok") or parsed.get("ready_to_advance")),
+            "feedback": parsed.get("feedback",""),
+            "next_step": next_step,
+            "message": message
+        })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.get("/problems/<pid>")
-def problem_detail_alt(pid):
-    try:
-        p = fetch_page(pid)
-        return jsonify({"problem": p})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/generate-steps", methods=["OPTIONS", "POST"])
-def generate_steps_alias():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    data = request.get_json(silent=True) or {}
-    pid = data.get("problem_id") or request.args.get("problem_id") or request.args.get("id")
-    if not pid:
-        return jsonify({"error": "missing problem_id"}), 400
-    try:
-        p = fetch_page(pid)
-        raw = p.get("step_by_step", "")
-        steps_list = parse_steps(raw)
-        if not steps_list:
-            steps_list = generate_steps_with_llm(p)
-        return jsonify({"steps": steps_list})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/check-step", methods=["OPTIONS", "POST"])
-def check_step_alias():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    data = request.get_json(force=True, silent=True) or {}
-    data.setdefault("mode", "tutor")
-    # Reuse /chat handler
-    with app.test_request_context("/chat", method="POST", json=data, headers=request.headers):
-        return chat()
+        # No romper UX si Anthropic falla
+        return jsonify({
+            "ok": False,
+            "feedback": f"(Tutor offline) I couldn't evaluate this step: {e}",
+            "next_step": step_id,
+            "message": "Try rechecking or move on."
+        })
 
 # ---------- Gunicorn entry ----------
 if __name__ == "__main__":

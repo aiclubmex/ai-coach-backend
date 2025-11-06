@@ -1,18 +1,10 @@
 # backend.py
 # Flask API for Physics AI Coach
-# Endpoints:
 # - GET  /                 -> health
 # - GET  /problems         -> list problems from Notion
 # - GET  /problem/<id>     -> full fields for one problem
 # - GET  /steps/<id>       -> step-by-step plan (Notion or auto-LLM)
-# - POST /chat             -> checks a student's step / next hint
-#
-# Notas:
-# - Incluye autogeneración de pasos con LLM cuando Notion no los tenga.
-# - Aumenta timeouts y agrega manejo de errores para respuestas JSON del modelo.
-# - /steps ahora devuelve también el "source": "notion" o "llm".
-# - CORS soporta múltiples orígenes (env FRONTEND_ORIGINS, separados por coma).
-# - call_anthropic_api es tolerante a variaciones de payload/response.
+# - POST /chat             -> checks a student's step / hint / student chat
 
 import os, re, json
 from typing import List, Dict, Any, Optional
@@ -27,13 +19,14 @@ NOTION_API_KEY        = os.environ.get("NOTION_API_KEY", "")
 NOTION_DB_ID          = os.environ.get("NOTION_DATABASE_ID", "")
 ANTHROPIC_API_KEY     = os.environ.get("ANTHROPIC_API_KEY", "")
 
-# Un solo origen (compat) y/o lista separada por comas
+# Modelo configurable: usa el que ya tenías habilitado antes si quieres
+ANTHROPIC_MODEL       = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620")
+
 FRONTEND_ORIGIN       = os.environ.get("FRONTEND_ORIGIN", "https://aiclub.com.mx")
-FRONTEND_ORIGINS_CSV  = os.environ.get("FRONTEND_ORIGINS", "")  # p.ej. "https://aiclub.com.mx,http://localhost:5173"
+FRONTEND_ORIGINS_CSV  = os.environ.get("FRONTEND_ORIGINS", "")
 EXTRA_ORIGINS         = [o.strip() for o in FRONTEND_ORIGINS_CSV.split(",") if o.strip()]
 ALLOWED_ORIGINS       = [FRONTEND_ORIGIN] + EXTRA_ORIGINS
 
-# Timeouts
 NOTION_TIMEOUT_SEC    = int(os.environ.get("NOTION_TIMEOUT_SEC", "15"))
 ANTHROPIC_TIMEOUT_SEC = int(os.environ.get("ANTHROPIC_TIMEOUT_SEC", "60"))
 
@@ -56,121 +49,164 @@ NOTION_HEADERS = {
 UUID_RE = re.compile(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 def sanitize_uuid(value: str) -> str:
-    """Return a Notion-acceptable UUID (with hyphens) or empty if not found."""
     if not value:
         return ""
-    match = UUID_RE.search(value)
-    if not match:
+    m = UUID_RE.search(value)
+    if not m:
         return ""
-    raw = match.group(0).replace("-", "")
+    raw = m.group(0).replace("-", "")
     return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
 
 def fetch_page(page_id: str) -> Dict[str, Any]:
-    """Retrieve a single Notion page by ID and flatten main property types."""
+    """Retrieve a single Notion page and flatten common properties."""
     pid = sanitize_uuid(page_id)
     if not pid:
         raise ValueError("Invalid page ID")
     url = f"{NOTION_BASE}/pages/{pid}"
-    resp = requests.get(url, headers=NOTION_HEADERS, timeout=NOTION_TIMEOUT_SEC)
-    resp.raise_for_status()
-    page_data = resp.json()
-
+    r = requests.get(url, headers=NOTION_HEADERS, timeout=NOTION_TIMEOUT_SEC)
+    r.raise_for_status()
+    page_data = r.json()
     props = page_data.get("properties", {})
-    out: Dict[str, Any] = {"id": pid}
 
+    out: Dict[str, Any] = {"id": pid}
     for k, v in props.items():
-        ptype = v.get("type")
-        if ptype == "title":
+        t = v.get("type")
+        if t == "title":
             arr = v.get("title", [])
             out[k] = arr[0].get("plain_text", "") if arr else ""
-        elif ptype == "rich_text":
+        elif t == "rich_text":
             arr = v.get("rich_text", [])
             out[k] = arr[0].get("plain_text", "") if arr else ""
-        elif ptype == "number":
+        elif t == "number":
             out[k] = v.get("number")
-        elif ptype == "select":
+        elif t == "select":
             sel = v.get("select")
             out[k] = sel.get("name", "") if sel else ""
-        elif ptype == "multi_select":
+        elif t == "multi_select":
             out[k] = [ms.get("name", "") for ms in v.get("multi_select", [])]
-        elif ptype == "url":
+        elif t == "url":
             out[k] = v.get("url", "")
-        elif ptype == "files":
+        elif t == "files":
             files = v.get("files", [])
             out[k] = [f.get("file", {}).get("url") or f.get("external", {}).get("url") for f in files]
-
     return out
 
 def query_database(database_id: str, filter_obj: Optional[dict] = None) -> List[Dict[str, Any]]:
-    """Query a Notion database and return flattened rows."""
-    db_id = sanitize_uuid(database_id)
-    if not db_id:
+    dbid = sanitize_uuid(database_id)
+    if not dbid:
         raise ValueError("Invalid database ID")
-
-    url = f"{NOTION_BASE}/databases/{db_id}/query"
+    url = f"{NOTION_BASE}/databases/{dbid}/query"
     payload: Dict[str, Any] = {}
     if filter_obj:
         payload["filter"] = filter_obj
-
-    resp = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=NOTION_TIMEOUT_SEC)
-    resp.raise_for_status()
-    data = resp.json()
-
+    r = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=NOTION_TIMEOUT_SEC)
+    r.raise_for_status()
+    data = r.json()
     results: List[Dict[str, Any]] = []
     for page in data.get("results", []):
         pid = page.get("id", "")
         props = page.get("properties", {})
         obj: Dict[str, Any] = {"id": pid}
         for k, v in props.items():
-            ptype = v.get("type")
-            if ptype == "title":
+            t = v.get("type")
+            if t == "title":
                 arr = v.get("title", [])
                 obj[k] = arr[0].get("plain_text", "") if arr else ""
-            elif ptype == "rich_text":
+            elif t == "rich_text":
                 arr = v.get("rich_text", [])
                 obj[k] = arr[0].get("plain_text", "") if arr else ""
-            elif ptype == "number":
+            elif t == "number":
                 obj[k] = v.get("number")
-            elif ptype == "select":
+            elif t == "select":
                 sel = v.get("select")
                 obj[k] = sel.get("name", "") if sel else ""
-            elif ptype == "multi_select":
+            elif t == "multi_select":
                 obj[k] = [ms.get("name", "") for ms in v.get("multi_select", [])]
         results.append(obj)
     return results
 
+# ---------- Extraer pasos desde bloques ----------
+def fetch_page_blocks(page_id: str) -> list:
+    pid = sanitize_uuid(page_id)
+    url = f"{NOTION_BASE}/blocks/{pid}/children?page_size=100"
+    r = requests.get(url, headers=NOTION_HEADERS, timeout=NOTION_TIMEOUT_SEC)
+    r.raise_for_status()
+    data = r.json()
+    results = data.get("results", [])
+
+    # Cargar sub-bloques si existen
+    expanded = []
+    for b in results:
+        expanded.append(b)
+        if b.get("has_children"):
+            bid = b.get("id")
+            try:
+                sub = requests.get(f"{NOTION_BASE}/blocks/{bid}/children?page_size=100",
+                                   headers=NOTION_HEADERS, timeout=NOTION_TIMEOUT_SEC)
+                sub.raise_for_status()
+                b["children"] = sub.json().get("results", [])
+            except Exception as e:
+                print(f"[BLOCKS] child fetch error: {e}")
+    return results
+
+def extract_steps_from_blocks(blocks: list) -> List[str]:
+    items: List[str] = []
+    for b in blocks:
+        t = b.get("type")
+        if t in ("numbered_list_item", "bulleted_list_item", "to_do", "paragraph"):
+            rich = b.get(t, {}).get("rich_text", [])
+            txt = "".join([x.get("plain_text", "") for x in rich]).strip()
+            if txt:
+                # Evita párrafos genéricos muy cortos
+                if t == "paragraph" and len(txt) < 4:
+                    pass
+                else:
+                    items.append(txt)
+        # Hijos
+        if b.get("children"):
+            items += extract_steps_from_blocks(b.get("children"))
+    return items
+
 def parse_steps(text: str) -> List[Dict[str, str]]:
-    """Parse step-by-step text into structured steps."""
+    """Convierte texto con listas numeradas/viñetas en objetos paso."""
     if not text or not text.strip():
         return []
-
-    lines = text.strip().split("\n")
+    lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
     steps: List[Dict[str, str]] = []
-
     for i, ln in enumerate(lines, start=1):
-        ln = ln.strip()
-        if not ln:
-            continue
-        # Remove numbering like "1)", "1.", "Step 1:", etc.
-        clean_ln = re.sub(r'^(\d+[\)\.:]?\s*|Step\s+\d+[\)\.:]?\s*)', '', ln, flags=re.IGNORECASE).strip()
-        # Only add if there's actual content (not just a number)
-        if clean_ln and len(clean_ln) > 2:
-            steps.append({"id": str(i), "description": clean_ln, "rubric": ""})
-
-    # If we got steps but they're all too short (just numbers), return empty
-    if steps and all(len(s["description"]) < 5 for s in steps):
-        return []
+        clean = re.sub(
+            r'^(\d+\s*[\)\.\-:]*|step\s*\d+\s*[\)\.\-:]*|[-•]\s*)',
+            '', ln, flags=re.I
+        ).strip()
+        if len(clean) >= 2:
+            steps.append({"id": str(i), "description": clean, "rubric": ""})
     return steps
 
+def get_steps_text_from_notion(page: Dict[str, Any]) -> str:
+    """Intenta leer los pasos desde propiedades comunes o desde bloques."""
+    CANDIDATES = [
+        "step_by_step", "Steps", "steps", "Pasos", "Plan",
+        "Solution Steps", "solution_steps", "Step Plan"
+    ]
+    for key in CANDIDATES:
+        val = page.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+
+    # Si no hay propiedad, lee listas de los bloques
+    try:
+        blocks = fetch_page_blocks(page.get("id", ""))
+        block_texts = extract_steps_from_blocks(blocks)
+        if block_texts:
+            return "\n".join(block_texts)
+    except Exception as e:
+        print(f"[STEPS] blocks fallback error: {e}")
+    return ""
+
 # ==============================
-# Anthropic helper with improved error handling
+# Anthropic helper (robusto, con retry)
 # ==============================
 def call_anthropic_api(prompt: str, max_tokens: int = 1024) -> str:
-    """
-    Call Anthropic API directly via HTTP.
-    Returns the text response or raises an exception.
-    Tolerant a distintos formatos de payload/respuesta.
-    """
     if not ANTHROPIC_API_KEY:
         raise ValueError("ANTHROPIC_API_KEY not configured")
 
@@ -181,56 +217,61 @@ def call_anthropic_api(prompt: str, max_tokens: int = 1024) -> str:
         "content-type": "application/json",
     }
 
-    # Contenido como bloques de texto (más robusto para versiones recientes)
-    payload = {
-        "model": "claude-3-5-sonnet-20241022",  # equivalente reciente; ajusta si tu cuenta usa otro ID
+    # Intento 1: esquema moderno (content como bloques)
+    payload1 = {
+        "model": ANTHROPIC_MODEL,
         "max_tokens": max_tokens,
         "temperature": 0,
-        "system": "You are a helpful IB Physics tutor. Always respond with valid JSON only when explicitly asked; otherwise provide concise text.",
+        "system": "You are a helpful IB Physics tutor. When asked for JSON, return ONLY valid JSON.",
         "messages": [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": prompt}]
-            }
+            {"role": "user", "content": [{"type": "text", "text": prompt}]}
         ],
     }
 
+    # Intento 2: esquema alternativo (contenido como string plano)
+    payload2 = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "system": "You are a helpful IB Physics tutor. When asked for JSON, return ONLY valid JSON.",
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+    }
+
+    def _extract_text(resp_json: dict) -> str:
+        content = resp_json.get("content", [])
+        if isinstance(content, list) and content:
+            first = content[0]
+            if isinstance(first, dict):
+                return first.get("text") or first.get("content") or ""
+            return str(first)
+        return ""
+
     try:
-        print("[API] Calling Anthropic API…")
-        resp = requests.post(url, headers=headers, json=payload, timeout=ANTHROPIC_TIMEOUT_SEC)
-        print(f"[API] Status: {resp.status_code}")
-        # recorta para logs
-        preview = resp.text[:300].replace("\n", " ")
-        print(f"[API] Response preview: {preview}")
-
-        if resp.status_code != 200:
-            try:
-                error_data = resp.json()
-            except Exception:
-                error_data = {}
-            error_type = (error_data.get("error") or {}).get("type", "unknown")
-            error_msg = (error_data.get("error") or {}).get("message", resp.text)
-            raise Exception(f"Anthropic API error ({error_type}): {error_msg}")
-
-        data = resp.json()
-
-        # Formatos posibles:
-        # - {"content":[{"type":"text","text":"..."}], ...}
-        # - {"content":[{"text":"..."}], ...}  (menos común)
-        # Aseguramos extraer el primer bloque de texto.
-        content = data.get("content", [])
-        if not content:
-            raise Exception("Empty response content from Anthropic API")
-
-        first = content[0]
-        if isinstance(first, dict):
-            text = first.get("text") or first.get("content") or ""
+        print(f"[API] Anthropic try #1 model={ANTHROPIC_MODEL}")
+        r = requests.post(url, headers=headers, json=payload1, timeout=ANTHROPIC_TIMEOUT_SEC)
+        if r.status_code == 200:
+            txt = _extract_text(r.json()).strip()
+            if not txt:
+                raise Exception("Empty text in response")
+            return txt
         else:
-            text = str(first)
+            print(f"[API] Try #1 failed {r.status_code}: {r.text[:200]}")
 
-        if not text:
-            raise Exception("No text content in Anthropic API response")
-        return text
+        print("[API] Anthropic try #2 (compat payload)")
+        r2 = requests.post(url, headers=headers, json=payload2, timeout=ANTHROPIC_TIMEOUT_SEC)
+        if r2.status_code == 200:
+            txt = _extract_text(r2.json()).strip()
+            if not txt:
+                raise Exception("Empty text in response (retry)")
+            return txt
+        else:
+            try:
+                errj = r2.json()
+            except Exception:
+                errj = {}
+            raise Exception(f"Anthropic error: {errj.get('error', {}).get('message', r2.text)}")
 
     except requests.exceptions.Timeout:
         raise Exception("Anthropic API timeout")
@@ -240,10 +281,8 @@ def call_anthropic_api(prompt: str, max_tokens: int = 1024) -> str:
         raise Exception(f"Anthropic API error: {str(e)}")
 
 def generate_steps_with_llm(problem: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Generate step-by-step solution using LLM if not in Notion."""
     title = problem.get("title", "") or problem.get("Name", "")
     statement = problem.get("statement", "")
-
     prompt = f"""Given this IB Physics problem, create a step-by-step solution plan.
 
 Problem: {title}
@@ -262,30 +301,26 @@ Example:
 6) Check units and reasonableness
 
 Steps:"""
-
     try:
         text = call_anthropic_api(prompt, max_tokens=512)
-        return parse_steps(text)
+        parsed = parse_steps(text)
+        if parsed:
+            return parsed
     except Exception as e:
         print(f"[ERROR] Failed to generate steps: {e}")
-        # Fallback genérico
-        return [
-            {"id": "1", "description": "Read and understand the problem", "rubric": ""},
-            {"id": "2", "description": "Identify relevant physics concepts", "rubric": ""},
-            {"id": "3", "description": "Set up equations", "rubric": ""},
-            {"id": "4", "description": "Solve", "rubric": ""},
-        ]
+    # Fallback muy simple (como te funcionaba antes)
+    return [
+        {"id": "1", "description": "Read and understand the problem", "rubric": ""},
+        {"id": "2", "description": "Identify relevant physics concepts", "rubric": ""},
+        {"id": "3", "description": "Set up equations", "rubric": ""},
+        {"id": "4", "description": "Solve", "rubric": ""},
+    ]
 
-# ==============================
-# Utilidades para parsing seguro de JSON del modelo
-# ==============================
+# ---------- Utilidad: intentar extraer JSON del modelo ----------
 def try_extract_json_block(text: str) -> Optional[str]:
-    """Intenta extraer un bloque JSON con claves conocidas."""
     if not text:
         return None
     s = text.strip()
-
-    # Remueve fences de markdown si aparecieran
     if "```json" in s:
         try:
             s = s.split("```json", 1)[1].split("```", 1)[0]
@@ -296,21 +331,15 @@ def try_extract_json_block(text: str) -> Optional[str]:
             s = s.split("```", 1)[1].split("```", 1)[0]
         except Exception:
             pass
-
     s = s.strip()
-
-    # Búsqueda conservadora de objeto con "ok" y "feedback"
     try:
         m = re.search(r'\{[^{}]*"ok"[^{}]*"feedback"[^{}]*\}', s, re.DOTALL)
         if m:
             return m.group(0)
     except Exception:
         pass
-
-    # Si el texto parece ser un JSON completo
     if s.startswith("{") and s.endswith("}"):
         return s
-
     return None
 
 # ==============================
@@ -342,11 +371,9 @@ def get_problem(problem_id: str):
 def get_steps(problem_id: str):
     try:
         page = fetch_page(problem_id)
-        steps_text = page.get("step_by_step", "")
-        # Intentar parsear pasos desde Notion
-        steps = parse_steps(steps_text) if steps_text else []
+        raw_text = get_steps_text_from_notion(page)
+        steps = parse_steps(raw_text)
         source = "notion" if steps else "llm"
-        # Si no hay pasos válidos, generar con LLM
         if not steps:
             print("[STEPS] No valid steps in Notion, generating with LLM…")
             steps = generate_steps_with_llm(page)
@@ -355,7 +382,13 @@ def get_steps(problem_id: str):
         return jsonify({"steps": steps, "source": source})
     except Exception as e:
         print(f"[ERROR] Failed to get steps: {e}")
-        return jsonify({"error": str(e)}), 500
+        # Aún así respondemos algo (para que el front no muera)
+        return jsonify({"steps": [
+            {"id": "1", "description": "Read and understand the problem", "rubric": ""},
+            {"id": "2", "description": "Identify relevant physics concepts", "rubric": ""},
+            {"id": "3", "description": "Set up equations", "rubric": ""},
+            {"id": "4", "description": "Solve", "rubric": ""},
+        ], "source": "fallback"}), 200
 
 @app.post("/chat")
 def chat():
@@ -385,16 +418,18 @@ def chat():
     try:
         problem = fetch_page(problem_id)
     except Exception as e:
-        return jsonify({"error": f"Cannot read problem: {e}"}), 500
+        # fallback suave
+        problem = {"id": problem_id}
+        print(f"[WARN] Cannot read problem: {e}")
 
-    # Get steps (from Notion or LLM)
-    steps_text = problem.get("step_by_step", "")
+    # Steps (Notion primero)
+    steps_text = get_steps_text_from_notion(problem)
     steps_list = parse_steps(steps_text) if steps_text else []
     if not steps_list:
         print("[CHAT] No valid steps found, generating with LLM…")
         steps_list = generate_steps_with_llm(problem)
 
-    # Find current step
+    # Paso actual
     current_step = None
     for s in steps_list:
         if s.get("id") == step_id:
@@ -404,18 +439,19 @@ def chat():
         current_step = steps_list[0]
         step_id = current_step.get("id", "1")
 
-    # Si no hay clave de Anthropic, responder "sin IA" pero funcional
+    # Si no hay clave de Anthropic, comportamiento anterior "benigno"
     if not ANTHROPIC_API_KEY:
+        ok = (mode != "tutor") or (len(student_answer) > 5)
         return jsonify({
-            "ok": True,
+            "ok": ok,
             "feedback": "AI Coach is not configured. Your answer was recorded.",
-            "ready_to_advance": True,
-            "next_step": str(int(step_id) + 1) if step_id.isdigit() else step_id,
+            "ready_to_advance": ok,
+            "next_step": str(int(step_id) + 1) if (ok and step_id.isdigit()) else step_id,
             "message": "Continue to next step.",
             "reply": "AI Coach is not configured."
         })
 
-    # MODE: Free chat (student asking questions)
+    # ===== MODO STUDENT =====
     if mode == "student" and message_text:
         prompt = f"""You are an IB Physics tutor helping with this problem:
 
@@ -430,9 +466,10 @@ Provide a brief, helpful response (2-3 sentences). Guide them towards understand
             return jsonify({"reply": reply.strip()})
         except Exception as e:
             print(f"[ERROR] Free chat failed: {e}")
-            return jsonify({"reply": f"Sorry, I encountered an error: {str(e)[:120]}"}), 500
+            # NO 500: fallback en 200
+            return jsonify({"reply": "I couldn't reach the AI right now, but try focusing on the key formula and units for this step."})
 
-    # MODE: Hint
+    # ===== MODO HINT =====
     if mode == "hint":
         prompt = f"""You are an IB Physics tutor. Provide a helpful hint for this step.
 
@@ -445,10 +482,9 @@ Provide ONE specific hint (1-2 sentences) that guides the student without giving
             return jsonify({"hint": hint.strip()})
         except Exception as e:
             print(f"[ERROR] Hint failed: {e}")
-            # Fallback neutro usando el propio paso
             return jsonify({"hint": f"Think about the physics concepts involved in: {current_step.get('description', '')}"}), 200
 
-    # MODE: Tutor (evaluate answer)
+    # ===== MODO TUTOR (evaluación) =====
     if mode == "tutor":
         if not student_answer:
             return jsonify({
@@ -458,7 +494,6 @@ Provide ONE specific hint (1-2 sentences) that guides the student without giving
                 "next_step": step_id,
                 "message": "Write your reasoning above."
             })
-
         eval_prompt = f"""You are an IB Physics tutor evaluating a student's step.
 
 Problem: {problem.get('title', '') or problem.get('Name', '')}
@@ -480,40 +515,26 @@ Rules:
 - feedback: 1-2 sentences about their answer
 - ready_to_advance: true if they can move to next step
 - next_hint: suggest what to include if incomplete"""
-
         try:
-            response_text = call_anthropic_api(eval_prompt, max_tokens=512)
-            response_text = response_text.strip()
-
-            # Intentar extraer JSON válido
-            json_block = try_extract_json_block(response_text)
-            if json_block is None:
-                # Último intento: si todo el texto ya es JSON, úsalo
-                json_block = response_text if response_text.startswith("{") else None
-
+            response_text = call_anthropic_api(eval_prompt, max_tokens=512).strip()
+            json_block = try_extract_json_block(response_text) or (response_text if response_text.startswith("{") else None)
+            parsed = None
             if json_block:
                 try:
                     parsed = json.loads(json_block)
                 except json.JSONDecodeError as je:
-                    print(f"[ERROR] JSON parse failed: {je}")
-                    print(f"[ERROR] Response was: {response_text[:300]}")
-                    parsed = None
-            else:
-                parsed = None
-
-            # Fallback si no parsea
+                    print(f"[ERROR] JSON parse failed: {je}; raw: {response_text[:300]}")
             if not parsed or not isinstance(parsed, dict):
+                # Fallback razonable si el modelo no dio JSON bien formado
                 parsed = {
                     "ok": len(student_answer) > 15,
                     "feedback": "Your answer was recorded. Try to be more specific with physics concepts and units.",
                     "ready_to_advance": len(student_answer) > 15,
                     "next_hint": "Explain which formulas or principles apply."
                 }
-
             can_advance = bool(parsed.get("ready_to_advance") or parsed.get("ok"))
             next_step = str(int(step_id) + 1) if (can_advance and step_id.isdigit()) else step_id
             message = parsed.get("next_hint", "") if not can_advance else "Great! Continue to the next step."
-
             return jsonify({
                 "ok": can_advance,
                 "feedback": parsed.get("feedback", ""),
@@ -521,27 +542,28 @@ Rules:
                 "next_step": next_step,
                 "message": message
             })
-
         except Exception as e:
             print(f"[ERROR] Evaluation failed: {e}")
+            # NO 500: fallback en 200
+            ok = len(student_answer.strip()) > 5
             return jsonify({
-                "ok": False,
-                "feedback": f"Error: {str(e)[:200]}",
-                "ready_to_advance": False,
-                "next_step": step_id,
-                "message": "Please try again."
-            }), 500
+                "ok": ok,
+                "feedback": "Recorded. Be explicit about the formula and why it applies.",
+                "ready_to_advance": ok,
+                "next_step": str(int(step_id) + 1) if (ok and step_id.isdigit()) else step_id,
+                "message": "" if ok else "Try naming the law/formula and include units."
+            })
 
-    # Default fallback
     return jsonify({"error": f"Unsupported mode: {mode}"}), 400
 
 # ==============================
-# Gunicorn / Dev entry
+# Entry
 # ==============================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     debug = os.environ.get("FLASK_DEBUG", "true").lower() == "true"
     print(f"Starting AI Coach backend on 0.0.0.0:{port} (debug={debug})")
     print(f"Allowed CORS origins: {ALLOWED_ORIGINS}")
+    print(f"Anthropic model: {ANTHROPIC_MODEL}")
     app.run(host="0.0.0.0", port=port, debug=debug)
 

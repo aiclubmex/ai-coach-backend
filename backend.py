@@ -124,19 +124,32 @@ def query_database(database_id: str, filter_obj: dict = None) -> List[Dict[str, 
 
 def parse_steps(text: str) -> List[Dict[str, str]]:
     """Parse step-by-step text into structured steps."""
-    if not text:
+    if not text or not text.strip():
         return []
+    
     lines = text.strip().split("\n")
     steps = []
+    
     for i, ln in enumerate(lines, start=1):
         ln = ln.strip()
         if not ln:
             continue
-        steps.append({
-            "id": str(i),
-            "description": ln,
-            "rubric": ""
-        })
+        
+        # Remove numbering like "1)", "1.", "Step 1:", etc.
+        clean_ln = re.sub(r'^(\d+[\)\.:]?\s*|Step\s+\d+[\)\.:]?\s*)', '', ln, flags=re.IGNORECASE).strip()
+        
+        # Only add if there's actual content (not just a number)
+        if clean_ln and len(clean_ln) > 2:
+            steps.append({
+                "id": str(i),
+                "description": clean_ln,
+                "rubric": ""
+            })
+    
+    # If we got steps but they're all too short (just numbers), return empty
+    if steps and all(len(s["description"]) < 5 for s in steps):
+        return []
+    
     return steps
 
 # ==============================
@@ -172,7 +185,7 @@ def call_anthropic_api(prompt: str, max_tokens: int = 1024) -> str:
     
     try:
         print(f"[API] Calling Anthropic API...")
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)  # Increased to 60 seconds
         
         # Log status and response for debugging
         print(f"[API] Status: {resp.status_code}")
@@ -267,13 +280,19 @@ def get_steps(problem_id: str):
         page = fetch_page(problem_id)
         steps_text = page.get("step_by_step", "")
         
-        if steps_text and steps_text.strip():
-            steps = parse_steps(steps_text)
-        else:
+        # Try to parse steps from Notion
+        steps = parse_steps(steps_text) if steps_text else []
+        
+        # If no valid steps found, generate with LLM
+        if not steps:
+            print(f"[STEPS] No valid steps in Notion, generating with LLM...")
             steps = generate_steps_with_llm(page)
+        else:
+            print(f"[STEPS] Found {len(steps)} steps from Notion")
         
         return jsonify({"steps": steps})
     except Exception as e:
+        print(f"[ERROR] Failed to get steps: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.post("/chat")
@@ -306,9 +325,11 @@ def chat():
     
     # Get steps
     steps_text = problem.get("step_by_step", "")
-    if steps_text and steps_text.strip():
-        steps_list = parse_steps(steps_text)
-    else:
+    steps_list = parse_steps(steps_text) if steps_text else []
+    
+    # If no valid steps, generate with LLM
+    if not steps_list:
+        print(f"[CHAT] No valid steps found, generating with LLM...")
         steps_list = generate_steps_with_llm(problem)
     
     # Find current step
@@ -456,4 +477,4 @@ Rules:
 # Gunicorn entry
 # ==============================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True) 
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

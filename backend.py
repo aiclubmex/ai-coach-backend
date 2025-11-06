@@ -222,7 +222,7 @@ def steps(page_id):
         return jsonify({"mode": "tutor", "note": f"Unexpected: {e}", "steps": []}), 500
 
 # ==============================
-# 🔥 FUNCIÓN CHAT MEJORADA
+# 🔥 FUNCIÓN CHAT COMPLETAMENTE REHECHA
 # ==============================
 @app.post("/chat")
 def chat():
@@ -231,6 +231,7 @@ def chat():
     step_id         = str(data.get("step_id") or "")
     student_answer  = (data.get("student_answer") or "").strip()
     mode            = data.get("mode", "tutor")
+    message_text    = data.get("message", "").strip()
 
     if not problem_id:
         return jsonify({"error": "missing problem_id"}), 400
@@ -240,6 +241,62 @@ def chat():
     except Exception as e:
         return jsonify({"error": f"Cannot read problem: {e}"}), 500
 
+    # 🔥 MODO CHAT LIBRE (student mode)
+    if mode == "student" and message_text:
+        if not ANTHROPIC_API_KEY:
+            return jsonify({"reply": "AI not available"})
+        
+        try:
+            client = anthropic_client()
+            chat_prompt = f"""You are a helpful IB Physics tutor. Answer briefly (2-3 sentences).
+
+Problem: {p.get('problem_statement', '')[:200]}
+Student asks: "{message_text}"
+
+Answer:"""
+            
+            msg = client.messages.create(
+                model="claude-3-5-sonnet-latest",
+                max_tokens=200,
+                temperature=0.3,
+                messages=[{"role": "user", "content": chat_prompt}]
+            )
+            reply = ""
+            for b in msg.content:
+                if getattr(b, "type", "") == "text":
+                    reply += b.text
+            return jsonify({"reply": reply.strip()})
+        except Exception as e:
+            return jsonify({"reply": f"Error: {str(e)[:80]}"})
+
+    # 🔥 MODO HINT
+    if mode == "hint":
+        if not ANTHROPIC_API_KEY:
+            return jsonify({"reply": "AI not available"})
+        
+        try:
+            client = anthropic_client()
+            hint_prompt = f"""Give a short hint (1-2 sentences) WITHOUT the full answer.
+
+Step: {message_text}
+
+Hint:"""
+            
+            msg = client.messages.create(
+                model="claude-3-5-sonnet-latest",
+                max_tokens=150,
+                temperature=0.3,
+                messages=[{"role": "user", "content": hint_prompt}]
+            )
+            reply = ""
+            for b in msg.content:
+                if getattr(b, "type", "") == "text":
+                    reply += b.text
+            return jsonify({"reply": reply.strip()})
+        except Exception as e:
+            return jsonify({"reply": f"Error: {str(e)[:80]}"})
+
+    # 🔥 MODO TUTOR - Evaluar step
     steps_list = parse_steps(p.get("step_by_step", ""))
     if not steps_list:
         steps_list = generate_steps_with_llm(p)
@@ -253,49 +310,32 @@ def chat():
         current = steps_list[0]
         step_id = current["id"]
 
-    # No LLM? Return basic echo
     if not ANTHROPIC_API_KEY:
         return jsonify({
             "ok": True,
-            "feedback": "(No LLM) Answer received.",
+            "feedback": "(No AI) Answer recorded.",
             "next_step": str(int(step_id) + 1) if step_id.isdigit() else "",
-            "message": "Move to the next step."
+            "message": "Continue."
         })
 
     rub = current.get("rubric", "")
     
-    # 🔥 PROMPT MEJORADO - MÁS ESTRICTO
-    eval_prompt = f"""You are an IB Physics tutor. Evaluate this student's step.
+    # 🔥 PROMPT ULTRA SIMPLIFICADO
+    eval_prompt = f"""Evaluate student's physics answer.
 
-Problem:
-{p.get('problem_statement', '')[:300]}
+Step: {current.get('text')}
+Student: "{student_answer}"
 
-Given: {p.get('given_values', '')}
-Find: {p.get('find', '')}
-
-Current step {step_id}: {current.get('text')}
-Rubric: {rub or 'Check if reasoning is sound and physics concepts are correct'}
-
-Student wrote: "{student_answer}"
-
-CRITICAL: Respond with ONLY valid JSON. No markdown, no extra text.
-
-Format:
-{{
-  "ok": true,
-  "feedback": "Brief supportive message (1-2 sentences)",
-  "next_hint": "One concrete hint if wrong, empty string if correct",
-  "ready_to_advance": true
-}}
-
-JSON response:"""
+Return ONLY this exact JSON format with no other text:
+{{"ok": true, "feedback": "short message", "next_hint": "", "ready_to_advance": true}}"""
 
     try:
         client = anthropic_client()
         msg = client.messages.create(
             model="claude-3-5-sonnet-latest",
-            max_tokens=400,
-            temperature=0.2,
+            max_tokens=300,
+            temperature=0,
+            system="You output ONLY valid JSON. No markdown. No explanations.",
             messages=[{"role": "user", "content": eval_prompt}]
         )
         
@@ -304,47 +344,46 @@ JSON response:"""
             if getattr(b, "type", "") == "text":
                 text += b.text
         
-        # 🔥 LIMPIEZA ROBUSTA DE MARKDOWN
-        text = text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        elif text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
+        # Limpieza ultra agresiva
         text = text.strip()
         
-        # 🔥 PARSING CON FALLBACK
+        # Remover markdown
+        if "```json" in text.lower():
+            parts = text.lower().split("```json")
+            if len(parts) > 1:
+                text = parts[1].split("```")[0]
+        elif "```" in text:
+            parts = text.split("```")
+            if len(parts) >= 3:
+                text = parts[1]
+        
+        text = text.strip()
+        
+        # Buscar JSON
+        json_pattern = r'\{[^{}]*"ok"[^{}]*"feedback"[^{}]*\}'
+        json_match = re.search(json_pattern, text, re.DOTALL | re.IGNORECASE)
+        
+        if json_match:
+            text = json_match.group(0)
+        
+        # Parse o fallback
         try:
             parsed = json.loads(text)
         except:
-            # Fallback: buscar JSON con regex
-            json_match = re.search(r'\{[^{}]*"ok"[^{}]*\}', text, re.DOTALL)
-            if json_match:
-                try:
-                    parsed = json.loads(json_match.group(0))
-                except:
-                    parsed = {
-                        "ok": len(student_answer) > 5,
-                        "feedback": "Your answer was recorded. The AI response couldn't be parsed properly.",
-                        "ready_to_advance": len(student_answer) > 5,
-                        "next_hint": "Try being more specific with formulas and reasoning."
-                    }
-            else:
-                # Última opción: usar la respuesta como feedback
-                parsed = {
-                    "ok": len(student_answer) > 5,
-                    "feedback": text[:150] if len(text) < 150 else text[:150] + "...",
-                    "ready_to_advance": len(student_answer) > 5,
-                    "next_hint": ""
-                }
+            # Fallback simple
+            parsed = {
+                "ok": len(student_answer) >= 15,
+                "feedback": "Answer recorded. Be more specific about physics concepts.",
+                "ready_to_advance": len(student_answer) >= 15,
+                "next_hint": "Mention formulas and why they apply."
+            }
 
-        advance = parsed.get("ready_to_advance") or parsed.get("ok")
+        advance = bool(parsed.get("ready_to_advance") or parsed.get("ok"))
         next_step = str(int(step_id) + 1) if (advance and step_id.isdigit()) else step_id
-        message = parsed.get("next_hint", "") if not advance else "Great! Let's continue."
+        message = parsed.get("next_hint", "") if not advance else "Good! Continue."
 
         return jsonify({
-            "ok": bool(parsed.get("ok") or parsed.get("ready_to_advance")),
+            "ok": advance,
             "feedback": parsed.get("feedback", ""),
             "next_step": next_step,
             "message": message
@@ -353,9 +392,9 @@ JSON response:"""
     except Exception as e:
         return jsonify({
             "ok": False, 
-            "feedback": f"Error evaluating: {str(e)[:100]}", 
+            "feedback": f"System error: {str(e)[:60]}", 
             "next_step": step_id, 
-            "message": "Try rephrasing your answer."
+            "message": "Try again."
         }), 500
 
 # ==============================

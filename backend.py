@@ -221,6 +221,9 @@ def steps(page_id):
     except Exception as e:
         return jsonify({"mode": "tutor", "note": f"Unexpected: {e}", "steps": []}), 500
 
+# ==============================
+# 🔥 FUNCIÓN CHAT MEJORADA
+# ==============================
 @app.post("/chat")
 def chat():
     data = request.get_json(force=True, silent=True) or {}
@@ -250,7 +253,7 @@ def chat():
         current = steps_list[0]
         step_id = current["id"]
 
-    # No LLM? Return basic echo so el flujo no se rompe
+    # No LLM? Return basic echo
     if not ANTHROPIC_API_KEY:
         return jsonify({
             "ok": True,
@@ -260,28 +263,32 @@ def chat():
         })
 
     rub = current.get("rubric", "")
-    eval_prompt = f"""
-You are an IB Physics tutor. Evaluate the student's response for this step only.
+    
+    # 🔥 PROMPT MEJORADO - MÁS ESTRICTO
+    eval_prompt = f"""You are an IB Physics tutor. Evaluate this student's step.
 
-Problem (short):
-Statement: {p.get('problem_statement')}
-Given: {p.get('given_values')}
-Find: {p.get('find')}
+Problem:
+{p.get('problem_statement', '')[:300]}
 
-Current step {step_id}:
-"{current.get('text')}"
+Given: {p.get('given_values', '')}
+Find: {p.get('find', '')}
 
-Grading rubric (if any): {rub or "(none)"}
+Current step {step_id}: {current.get('text')}
+Rubric: {rub or 'Check if reasoning is sound and physics concepts are correct'}
 
-Student answer:
-\"\"\"{student_answer}\"\"\"
+Student wrote: "{student_answer}"
 
-Return JSON with keys:
-- ok: true/false
-- feedback: short and supportive explanation
-- next_hint: (if not ok) one concrete hint
-- ready_to_advance: true/false
-"""
+CRITICAL: Respond with ONLY valid JSON. No markdown, no extra text.
+
+Format:
+{{
+  "ok": true,
+  "feedback": "Brief supportive message (1-2 sentences)",
+  "next_hint": "One concrete hint if wrong, empty string if correct",
+  "ready_to_advance": true
+}}
+
+JSON response:"""
 
     try:
         client = anthropic_client()
@@ -289,20 +296,52 @@ Return JSON with keys:
             model="claude-3-5-sonnet-latest",
             max_tokens=400,
             temperature=0.2,
-            messages=[{"role": "user", "content": eval_prompt}],
+            messages=[{"role": "user", "content": eval_prompt}]
         )
+        
         text = ""
         for b in msg.content:
             if getattr(b, "type", "") == "text":
                 text += b.text
+        
+        # 🔥 LIMPIEZA ROBUSTA DE MARKDOWN
+        text = text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        
+        # 🔥 PARSING CON FALLBACK
         try:
-            parsed = json.loads(text.strip())
-        except Exception:
-            parsed = {"ok": False, "feedback": text, "ready_to_advance": False, "next_hint": ""}
+            parsed = json.loads(text)
+        except:
+            # Fallback: buscar JSON con regex
+            json_match = re.search(r'\{[^{}]*"ok"[^{}]*\}', text, re.DOTALL)
+            if json_match:
+                try:
+                    parsed = json.loads(json_match.group(0))
+                except:
+                    parsed = {
+                        "ok": len(student_answer) > 5,
+                        "feedback": "Your answer was recorded. The AI response couldn't be parsed properly.",
+                        "ready_to_advance": len(student_answer) > 5,
+                        "next_hint": "Try being more specific with formulas and reasoning."
+                    }
+            else:
+                # Última opción: usar la respuesta como feedback
+                parsed = {
+                    "ok": len(student_answer) > 5,
+                    "feedback": text[:150] if len(text) < 150 else text[:150] + "...",
+                    "ready_to_advance": len(student_answer) > 5,
+                    "next_hint": ""
+                }
 
         advance = parsed.get("ready_to_advance") or parsed.get("ok")
         next_step = str(int(step_id) + 1) if (advance and step_id.isdigit()) else step_id
-        message = parsed.get("next_hint") if not advance else "Great! Let's go on."
+        message = parsed.get("next_hint", "") if not advance else "Great! Let's continue."
 
         return jsonify({
             "ok": bool(parsed.get("ok") or parsed.get("ready_to_advance")),
@@ -310,8 +349,14 @@ Return JSON with keys:
             "next_step": next_step,
             "message": message
         })
+        
     except Exception as e:
-        return jsonify({"ok": False, "feedback": f"LLM error: {e}", "next_step": step_id, "message": ""}), 500
+        return jsonify({
+            "ok": False, 
+            "feedback": f"Error evaluating: {str(e)[:100]}", 
+            "next_step": step_id, 
+            "message": "Try rephrasing your answer."
+        }), 500
 
 # ==============================
 # Gunicorn entry

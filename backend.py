@@ -40,365 +40,420 @@ UUID_RE = re.compile(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 
 def sanitize_uuid(value: str) -> str:
     """Return a Notion-acceptable UUID (with hyphens) or empty if not found."""
-    if not value:
+    match = UUID_RE.search(value)
+    if not match:
         return ""
-    m = UUID_RE.search(value)
-    if not m:
-        return ""
-    uid = m.group(0).lower()
-    if len(uid) == 32:
-        # insert hyphens 8-4-4-4-12
-        uid = f"{uid[0:8]}-{uid[8:12]}-{uid[12:16]}-{uid[16:20]}-{uid[20:32]}"
-    return uid
-
-def _rt_to_plain(rt: Any) -> str:
-    if not rt: return ""
-    parts = []
-    for x in rt:
-        if isinstance(x, dict):
-            parts.append(x.get("plain_text") or (x.get("text") or {}).get("content", ""))
-    return "".join(parts).strip()
-
-def _get_prop(props: Dict[str, Any], key: str) -> str:
-    p = props.get(key)
-    if not p: return ""
-    t = p.get("type")
-    if t == "title":       return _rt_to_plain(p.get("title"))
-    if t == "rich_text":   return _rt_to_plain(p.get("rich_text"))
-    if t == "select":
-        sl = p.get("select")
-        return (sl or {}).get("name", "") if sl else ""
-    if t == "multi_select":
-        return ", ".join([x.get("name","") for x in p.get("multi_select", [])])
-    return ""
-
-def fetch_problems() -> List[Dict[str, Any]]:
-    url = f"{NOTION_BASE}/databases/{NOTION_DB_ID}/query"
-    payload = {"page_size": 100}
-    items: List[Dict[str, Any]] = []
-    while True:
-        r = requests.post(url, headers=NOTION_HEADERS, data=json.dumps(payload))
-        r.raise_for_status()
-        data = r.json()
-        for page in data.get("results", []):
-            props = page.get("properties", {})
-            items.append({
-                "id": page.get("id"),
-                "name": _get_prop(props, "Name") or _get_prop(props, "name") or "Untitled",
-                "difficulty": _get_prop(props, "difficulty") or _get_prop(props, "Difficulty"),
-            })
-        if not data.get("has_more"):
-            break
-        payload["start_cursor"] = data.get("next_cursor")
-    return items
+    raw = match.group(0).replace("-", "")
+    return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
 
 def fetch_page(page_id: str) -> Dict[str, Any]:
+    """Retrieve a single Notion page by ID."""
     pid = sanitize_uuid(page_id)
     if not pid:
-        raise ValueError(f"Invalid Notion page_id: {page_id!r}")
+        raise ValueError("Invalid page ID")
+    
     url = f"{NOTION_BASE}/pages/{pid}"
-    r = requests.get(url, headers=NOTION_HEADERS)
-    r.raise_for_status()
-    page = r.json()
-    props = page.get("properties", {})
-    return {
-        "id": page.get("id"),
-        "name": _get_prop(props, "Name") or _get_prop(props, "name") or "Untitled",
-        "difficulty": _get_prop(props, "difficulty") or _get_prop(props, "Difficulty"),
-        "problem_statement": _get_prop(props, "problem_statement"),
-        "given_values": _get_prop(props, "given_values"),
-        "find": _get_prop(props, "find"),
-        "key_concepts": _get_prop(props, "key_concepts"),
-        "common_mistakes": _get_prop(props, "common_mistakes"),
-        "final_answer": _get_prop(props, "final_answer"),
-        "step_by_step": _get_prop(props, "step_by_step"),
-    }
+    resp = requests.get(url, headers=NOTION_HEADERS, timeout=10)
+    resp.raise_for_status()
+    page_data = resp.json()
+    
+    props = page_data.get("properties", {})
+    out = {"id": pid}
+    
+    for k, v in props.items():
+        ptype = v.get("type")
+        if ptype == "title":
+            arr = v.get("title", [])
+            out[k] = arr[0].get("plain_text", "") if arr else ""
+        elif ptype == "rich_text":
+            arr = v.get("rich_text", [])
+            out[k] = arr[0].get("plain_text", "") if arr else ""
+        elif ptype == "number":
+            out[k] = v.get("number")
+        elif ptype == "select":
+            sel = v.get("select")
+            out[k] = sel.get("name", "") if sel else ""
+        elif ptype == "multi_select":
+            out[k] = [ms.get("name", "") for ms in v.get("multi_select", [])]
+        elif ptype == "url":
+            out[k] = v.get("url", "")
+        elif ptype == "files":
+            files = v.get("files", [])
+            out[k] = [f.get("file", {}).get("url") or f.get("external", {}).get("url") for f in files]
+    
+    return out
 
-# ==============================
-# Steps parsing / generation
-# ==============================
-STEP_RE = re.compile(r"^\s*(\d+)[\).:-]\s*(.+)$")
+def query_database(database_id: str, filter_obj: dict = None) -> List[Dict[str, Any]]:
+    """Query a Notion database."""
+    db_id = sanitize_uuid(database_id)
+    if not db_id:
+        raise ValueError("Invalid database ID")
+    
+    url = f"{NOTION_BASE}/databases/{db_id}/query"
+    payload = {}
+    if filter_obj:
+        payload["filter"] = filter_obj
+    
+    resp = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    
+    results = []
+    for page in data.get("results", []):
+        pid = page.get("id", "")
+        props = page.get("properties", {})
+        obj = {"id": pid}
+        for k, v in props.items():
+            ptype = v.get("type")
+            if ptype == "title":
+                arr = v.get("title", [])
+                obj[k] = arr[0].get("plain_text", "") if arr else ""
+            elif ptype == "rich_text":
+                arr = v.get("rich_text", [])
+                obj[k] = arr[0].get("plain_text", "") if arr else ""
+            elif ptype == "number":
+                obj[k] = v.get("number")
+            elif ptype == "select":
+                sel = v.get("select")
+                obj[k] = sel.get("name", "") if sel else ""
+            elif ptype == "multi_select":
+                obj[k] = [ms.get("name", "") for ms in v.get("multi_select", [])]
+        results.append(obj)
+    
+    return results
 
-def parse_steps(raw: str) -> List[Dict[str, str]]:
-    steps: List[Dict[str, str]] = []
-    if not raw: return steps
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line: continue
-        m = STEP_RE.match(line)
-        if m:
-            sid = m.group(1)
-            rest = m.group(2)
-            rubric = ""
-            if "| rubric:" in rest:
-                part, rub = rest.split("| rubric:", 1)
-                text = part.strip()
-                rubric = rub.strip()
-            else:
-                text = rest.strip()
-            steps.append({"id": sid, "text": text, "rubric": rubric})
-    if not steps and raw.strip():
-        steps.append({"id": "1", "text": raw.strip(), "rubric": ""})
+def parse_steps(text: str) -> List[Dict[str, str]]:
+    """Parse step-by-step text into structured steps."""
+    if not text:
+        return []
+    lines = text.strip().split("\n")
+    steps = []
+    for i, ln in enumerate(lines, start=1):
+        ln = ln.strip()
+        if not ln:
+            continue
+        steps.append({
+            "id": str(i),
+            "description": ln,
+            "rubric": ""
+        })
     return steps
 
-def anthropic_client():
-    from anthropic import Anthropic
-    return Anthropic(api_key=ANTHROPIC_API_KEY)
+# ==============================
+# Anthropic helper with improved error handling
+# ==============================
+def call_anthropic_api(prompt: str, max_tokens: int = 1024) -> str:
+    """
+    Call Anthropic API directly via HTTP request.
+    Returns the text response or raises an exception.
+    """
+    if not ANTHROPIC_API_KEY:
+        raise ValueError("ANTHROPIC_API_KEY not configured")
+    
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "system": "You are a helpful IB Physics tutor. Always respond with valid JSON only.",
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
+    
+    try:
+        print(f"[API] Calling Anthropic API...")
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        
+        # Log status and response for debugging
+        print(f"[API] Status: {resp.status_code}")
+        print(f"[API] Response: {resp.text[:200]}")
+        
+        if resp.status_code != 200:
+            error_data = resp.json() if resp.text else {}
+            error_type = error_data.get("error", {}).get("type", "unknown")
+            error_msg = error_data.get("error", {}).get("message", resp.text)
+            raise Exception(f"Anthropic API error ({error_type}): {error_msg}")
+        
+        data = resp.json()
+        content = data.get("content", [])
+        
+        if not content:
+            raise Exception("Empty response from Anthropic API")
+        
+        text = content[0].get("text", "")
+        return text
+        
+    except requests.exceptions.Timeout:
+        raise Exception("Anthropic API timeout")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Anthropic API request failed: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Anthropic API error: {str(e)}")
 
 def generate_steps_with_llm(problem: Dict[str, Any]) -> List[Dict[str, str]]:
-    if not ANTHROPIC_API_KEY:
-        return []
-    client = anthropic_client()
-    prompt = f"""
-You are a patient IB Physics tutor. Break this problem into 4–6 small steps.
-Each step: concise action the student should do next.
-Append a short grading rubric after a pipe like this: " | rubric: ...".
-Return plain text lines:
+    """Generate step-by-step solution using LLM if not in Notion."""
+    title = problem.get("title", "")
+    statement = problem.get("statement", "")
+    
+    prompt = f"""Given this IB Physics problem, create a step-by-step solution plan.
 
-1) ...
-2) ...
-3) ...
+Problem: {title}
+Statement: {statement}
 
-Problem:
-Statement: {problem.get('problem_statement')}
-Given: {problem.get('given_values')}
-Find: {problem.get('find')}
-Key concepts: {problem.get('key_concepts')}
-"""
-    msg = client.messages.create(
-        model="claude-3-5-sonnet-latest",
-        max_tokens=500,
-        temperature=0.2,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = ""
-    for b in msg.content:
-        if getattr(b, "type", "") == "text":
-            text += b.text
-    return parse_steps(text)
+Provide 4-6 steps that a student should follow to solve this problem.
+Format each step on a new line.
+Be specific about physics concepts and formulas needed.
+
+Example:
+1) Identify the relevant physics principles (Newton's laws, conservation of energy, etc.)
+2) Draw a diagram and label all forces/variables
+3) Write down the relevant equations
+4) Substitute known values with units
+5) Solve for the unknown
+6) Check units and reasonableness
+
+Steps:"""
+    
+    try:
+        text = call_anthropic_api(prompt, max_tokens=512)
+        return parse_steps(text)
+    except Exception as e:
+        print(f"[ERROR] Failed to generate steps: {e}")
+        return [
+            {"id": "1", "description": "Read and understand the problem", "rubric": ""},
+            {"id": "2", "description": "Identify relevant physics concepts", "rubric": ""},
+            {"id": "3", "description": "Set up equations", "rubric": ""},
+            {"id": "4", "description": "Solve", "rubric": ""},
+        ]
 
 # ==============================
 # Routes
 # ==============================
 @app.get("/")
-def health():
-    return jsonify({"ok": True})
+def index():
+    return jsonify({"status": "ok", "service": "ai-coach-backend"})
 
 @app.get("/problems")
-def problems():
+def list_problems():
+    if not NOTION_DB_ID:
+        return jsonify({"error": "NOTION_DATABASE_ID not set"}), 500
     try:
-        simplified = fetch_problems()
-        return jsonify({"problems": simplified})
+        items = query_database(NOTION_DB_ID)
+        return jsonify({"problems": items})
     except Exception as e:
-        return jsonify({"error": f"Error listing problems: {e}"}), 500
+        return jsonify({"error": str(e)}), 500
 
-@app.get("/problem/<page_id>")
-def problem_detail(page_id):
+@app.get("/problem/<problem_id>")
+def get_problem(problem_id: str):
     try:
-        p = fetch_page(page_id)
-        return jsonify({"problem": p})
+        page = fetch_page(problem_id)
+        return jsonify({"problem": page})
     except Exception as e:
-        return jsonify({"error": f"Error reading problem: {e}"}), 500
+        return jsonify({"error": str(e)}), 500
 
-@app.get("/steps/<page_id>")
-def steps(page_id):
+@app.get("/steps/<problem_id>")
+def get_steps(problem_id: str):
     try:
-        p = fetch_page(page_id)
-        raw = p.get("step_by_step", "")
-        steps_list = parse_steps(raw)
-        note = None
-        if not steps_list:
-            # auto-generate with LLM (tutor leads)
-            try:
-                steps_list = generate_steps_with_llm(p)
-                if not steps_list:
-                    note = "No steps in Notion. LLM not available or returned nothing."
-            except Exception as llm_err:
-                note = f"Could not generate steps: {llm_err}"
-        return jsonify({"mode": "tutor", "note": note, "steps": steps_list})
-    except requests.HTTPError as he:
-        return jsonify({"mode": "tutor", "note": f"Error reading steps: {he}", "steps": []}), 500
+        page = fetch_page(problem_id)
+        steps_text = page.get("step_by_step", "")
+        
+        if steps_text and steps_text.strip():
+            steps = parse_steps(steps_text)
+        else:
+            steps = generate_steps_with_llm(page)
+        
+        return jsonify({"steps": steps})
     except Exception as e:
-        return jsonify({"mode": "tutor", "note": f"Unexpected: {e}", "steps": []}), 500
+        return jsonify({"error": str(e)}), 500
 
-# ==============================
-# 🔥 FUNCIÓN CHAT COMPLETAMENTE REHECHA
-# ==============================
 @app.post("/chat")
 def chat():
+    """
+    Handle student interactions:
+    - mode='tutor': Evaluate student's step answer
+    - mode='hint': Provide a hint
+    - mode='student': Free chat about the problem
+    """
     data = request.get_json(force=True, silent=True) or {}
-    problem_id      = data.get("problem_id")
-    step_id         = str(data.get("step_id") or "")
-    student_answer  = (data.get("student_answer") or "").strip()
-    mode            = data.get("mode", "tutor")
-    message_text    = data.get("message", "").strip()
-
+    problem_id = data.get("problem_id")
+    step_id = str(data.get("step_id") or "1")
+    student_answer = (data.get("student_answer") or "").strip()
+    mode = data.get("mode", "tutor")
+    message_text = data.get("message", "").strip()
+    
+    print(f"[CHAT] mode={mode}, problem_id={problem_id}, step_id={step_id}")
+    print(f"[CHAT] student_answer={student_answer[:100]}")
+    print(f"[CHAT] message={message_text[:100]}")
+    
     if not problem_id:
         return jsonify({"error": "missing problem_id"}), 400
-
+    
+    # Fetch problem
     try:
-        p = fetch_page(problem_id)
+        problem = fetch_page(problem_id)
     except Exception as e:
         return jsonify({"error": f"Cannot read problem: {e}"}), 500
-
-    # 🔥 MODO CHAT LIBRE (student mode)
-    if mode == "student" and message_text:
-        if not ANTHROPIC_API_KEY:
-            return jsonify({"reply": "AI not available"})
-        
-        try:
-            client = anthropic_client()
-            chat_prompt = f"""You are a helpful IB Physics tutor. Answer briefly (2-3 sentences).
-
-Problem: {p.get('problem_statement', '')[:200]}
-Student asks: "{message_text}"
-
-Answer:"""
-            
-            msg = client.messages.create(
-                model="claude-3-5-sonnet-latest",
-                max_tokens=200,
-                temperature=0.3,
-                messages=[{"role": "user", "content": chat_prompt}]
-            )
-            reply = ""
-            for b in msg.content:
-                if getattr(b, "type", "") == "text":
-                    reply += b.text
-            return jsonify({"reply": reply.strip()})
-        except Exception as e:
-            return jsonify({"reply": f"Error: {str(e)[:80]}"})
-
-    # 🔥 MODO HINT
-    if mode == "hint":
-        if not ANTHROPIC_API_KEY:
-            return jsonify({"reply": "AI not available"})
-        
-        try:
-            client = anthropic_client()
-            hint_prompt = f"""Give a short hint (1-2 sentences) WITHOUT the full answer.
-
-Step: {message_text}
-
-Hint:"""
-            
-            msg = client.messages.create(
-                model="claude-3-5-sonnet-latest",
-                max_tokens=150,
-                temperature=0.3,
-                messages=[{"role": "user", "content": hint_prompt}]
-            )
-            reply = ""
-            for b in msg.content:
-                if getattr(b, "type", "") == "text":
-                    reply += b.text
-            return jsonify({"reply": reply.strip()})
-        except Exception as e:
-            return jsonify({"reply": f"Error: {str(e)[:80]}"})
-
-    # 🔥 MODO TUTOR - Evaluar step
-    steps_list = parse_steps(p.get("step_by_step", ""))
-    if not steps_list:
-        steps_list = generate_steps_with_llm(p)
-
-    current = None
+    
+    # Get steps
+    steps_text = problem.get("step_by_step", "")
+    if steps_text and steps_text.strip():
+        steps_list = parse_steps(steps_text)
+    else:
+        steps_list = generate_steps_with_llm(problem)
+    
+    # Find current step
+    current_step = None
     for s in steps_list:
         if s["id"] == step_id:
-            current = s
+            current_step = s
             break
-    if not current and steps_list:
-        current = steps_list[0]
-        step_id = current["id"]
-
+    
+    if not current_step and steps_list:
+        current_step = steps_list[0]
+        step_id = current_step["id"]
+    
+    # Check if API is available
     if not ANTHROPIC_API_KEY:
         return jsonify({
             "ok": True,
-            "feedback": "(No AI) Answer recorded.",
-            "next_step": str(int(step_id) + 1) if step_id.isdigit() else "",
-            "message": "Continue."
+            "feedback": "AI Coach is not configured. Your answer was recorded.",
+            "next_step": str(int(step_id) + 1) if step_id.isdigit() else step_id,
+            "message": "Continue to next step.",
+            "reply": "AI Coach is not configured."
         })
-
-    rub = current.get("rubric", "")
     
-    # 🔥 PROMPT ULTRA SIMPLIFICADO
-    eval_prompt = f"""Evaluate student's physics answer.
+    # MODE: Free chat (student asking questions)
+    if mode == "student" and message_text:
+        prompt = f"""You are an IB Physics tutor helping with this problem:
 
-Step: {current.get('text')}
-Student: "{student_answer}"
+Problem: {problem.get('title', '')}
+Statement: {problem.get('statement', '')}
 
-Return ONLY this exact JSON format with no other text:
-{{"ok": true, "feedback": "short message", "next_hint": "", "ready_to_advance": true}}"""
+Student asks: {message_text}
 
-    try:
-        client = anthropic_client()
-        msg = client.messages.create(
-            model="claude-3-5-sonnet-latest",
-            max_tokens=300,
-            temperature=0,
-            system="You output ONLY valid JSON. No markdown. No explanations.",
-            messages=[{"role": "user", "content": eval_prompt}]
-        )
+Provide a brief, helpful response (2-3 sentences). Guide them towards understanding without giving the full answer."""
         
-        text = ""
-        for b in msg.content:
-            if getattr(b, "type", "") == "text":
-                text += b.text
-        
-        # Limpieza ultra agresiva
-        text = text.strip()
-        
-        # Remover markdown
-        if "```json" in text.lower():
-            parts = text.lower().split("```json")
-            if len(parts) > 1:
-                text = parts[1].split("```")[0]
-        elif "```" in text:
-            parts = text.split("```")
-            if len(parts) >= 3:
-                text = parts[1]
-        
-        text = text.strip()
-        
-        # Buscar JSON
-        json_pattern = r'\{[^{}]*"ok"[^{}]*"feedback"[^{}]*\}'
-        json_match = re.search(json_pattern, text, re.DOTALL | re.IGNORECASE)
-        
-        if json_match:
-            text = json_match.group(0)
-        
-        # Parse o fallback
         try:
-            parsed = json.loads(text)
-        except:
-            # Fallback simple
-            parsed = {
-                "ok": len(student_answer) >= 15,
-                "feedback": "Answer recorded. Be more specific about physics concepts.",
-                "ready_to_advance": len(student_answer) >= 15,
-                "next_hint": "Mention formulas and why they apply."
-            }
+            reply = call_anthropic_api(prompt, max_tokens=256)
+            return jsonify({"reply": reply.strip()})
+        except Exception as e:
+            print(f"[ERROR] Free chat failed: {e}")
+            return jsonify({"reply": f"Sorry, I encountered an error: {str(e)[:100]}"})
+    
+    # MODE: Hint
+    if mode == "hint":
+        prompt = f"""You are an IB Physics tutor. Provide a helpful hint for this step.
 
-        advance = bool(parsed.get("ready_to_advance") or parsed.get("ok"))
-        next_step = str(int(step_id) + 1) if (advance and step_id.isdigit()) else step_id
-        message = parsed.get("next_hint", "") if not advance else "Good! Continue."
+Problem: {problem.get('title', '')}
+Current Step: {current_step.get('description', '')}
 
+Provide ONE specific hint (1-2 sentences) that guides the student without giving the answer directly."""
+        
+        try:
+            hint = call_anthropic_api(prompt, max_tokens=256)
+            return jsonify({"hint": hint.strip()})
+        except Exception as e:
+            print(f"[ERROR] Hint failed: {e}")
+            return jsonify({"hint": f"Try to think about the physics concepts involved in: {current_step.get('description', '')}"})
+    
+    # MODE: Tutor (evaluate answer)
+    if not student_answer:
         return jsonify({
-            "ok": advance,
+            "ok": False,
+            "feedback": "Please provide an answer to evaluate.",
+            "next_step": step_id,
+            "message": "Write your reasoning above."
+        })
+    
+    # Build evaluation prompt
+    eval_prompt = f"""You are an IB Physics tutor evaluating a student's step.
+
+Problem: {problem.get('title', '')}
+Step: {current_step.get('description', '')}
+Student's Answer: {student_answer}
+
+Evaluate if the student's reasoning is correct for this step.
+
+Respond with ONLY valid JSON (no markdown, no explanations):
+{{
+  "ok": true/false,
+  "feedback": "brief feedback message",
+  "ready_to_advance": true/false,
+  "next_hint": "hint if needed, or empty string"
+}}
+
+Rules:
+- ok: true if answer shows understanding of the step
+- feedback: 1-2 sentences about their answer
+- ready_to_advance: true if they can move to next step
+- next_hint: suggest what to include if incomplete"""
+    
+    try:
+        response_text = call_anthropic_api(eval_prompt, max_tokens=512)
+        
+        # Clean response
+        response_text = response_text.strip()
+        
+        # Remove markdown if present
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0]
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0]
+        
+        response_text = response_text.strip()
+        
+        # Try to extract JSON with regex
+        json_match = re.search(r'\{[^{}]*"ok"[^{}]*"feedback"[^{}]*\}', response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(0)
+        
+        # Parse JSON
+        try:
+            parsed = json.loads(response_text)
+        except json.JSONDecodeError as je:
+            print(f"[ERROR] JSON parse failed: {je}")
+            print(f"[ERROR] Response was: {response_text[:200]}")
+            # Fallback response
+            parsed = {
+                "ok": len(student_answer) > 15,
+                "feedback": "Your answer was recorded. Try to be more specific with physics concepts.",
+                "ready_to_advance": len(student_answer) > 15,
+                "next_hint": "Explain which formulas or principles apply."
+            }
+        
+        # Determine next step
+        can_advance = bool(parsed.get("ready_to_advance") or parsed.get("ok"))
+        next_step = str(int(step_id) + 1) if (can_advance and step_id.isdigit()) else step_id
+        message = parsed.get("next_hint", "") if not can_advance else "Great! Continue to the next step."
+        
+        return jsonify({
+            "ok": can_advance,
             "feedback": parsed.get("feedback", ""),
             "next_step": next_step,
             "message": message
         })
         
     except Exception as e:
+        print(f"[ERROR] Evaluation failed: {e}")
         return jsonify({
-            "ok": False, 
-            "feedback": f"System error: {str(e)[:60]}", 
-            "next_step": step_id, 
-            "message": "Try again."
+            "ok": False,
+            "feedback": f"Error: {str(e)[:100]}",
+            "next_step": step_id,
+            "message": "Please try again."
         }), 500
 
 # ==============================
 # Gunicorn entry
 # ==============================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

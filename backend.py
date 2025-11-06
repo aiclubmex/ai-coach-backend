@@ -222,38 +222,79 @@ def call_anthropic_api(prompt: str, max_tokens: int = 1024) -> str:
 
 def generate_steps_with_llm(problem: Dict[str, Any]) -> List[Dict[str, str]]:
     """Generate step-by-step solution using LLM if not in Notion."""
-    title = problem.get("title", "")
+    title = problem.get("title") or problem.get("name", "")
     statement = problem.get("statement", "")
+    given = problem.get("given_values", "")
+    find = problem.get("find", "")
     
-    prompt = f"""Given this IB Physics problem, create a step-by-step solution plan.
+    prompt = f"""You are an IB Physics HL teacher creating a step-by-step solution guide.
 
 Problem: {title}
+Given: {given}
+Find: {find}
 Statement: {statement}
 
-Provide 4-6 steps that a student should follow to solve this problem.
-Format each step on a new line.
-Be specific about physics concepts and formulas needed.
+Create a clear 4-6 step solution plan for this problem. Each step should be ONE sentence describing what the student needs to do.
 
-Example:
-1) Identify the relevant physics principles (Newton's laws, conservation of energy, etc.)
-2) Draw a diagram and label all forces/variables
-3) Write down the relevant equations
-4) Substitute known values with units
-5) Solve for the unknown
-6) Check units and reasonableness
+Format: Write each step on a new line, numbered like this:
+1. First step description
+2. Second step description
+3. Third step description
 
-Steps:"""
+Do NOT use JSON. Do NOT use markdown. Just plain numbered steps.
+
+Example format:
+1. Identify which object has mass distributed farther from the rotation axis
+2. Recall the moment of inertia formula I = Σmr²
+3. Compare how mass distribution affects I in both cases
+4. Determine which configuration has larger moment of inertia
+5. Explain your reasoning using the formula
+
+Now create the steps for the problem above:"""
     
     try:
         text = call_anthropic_api(prompt, max_tokens=512)
-        return parse_steps(text)
+        
+        # Clean up the response
+        text = text.strip()
+        
+        # Remove any markdown code blocks
+        if "```" in text:
+            # Extract content between ``` markers
+            parts = text.split("```")
+            if len(parts) >= 3:
+                text = parts[1]
+                # Remove language identifier like "json" or "text"
+                lines = text.split("\n")
+                if lines[0].strip() in ["json", "text", "plaintext", ""]:
+                    text = "\n".join(lines[1:])
+            else:
+                # Just remove the markers
+                text = text.replace("```", "")
+        
+        # Remove any JSON-like content
+        if text.strip().startswith("{") or text.strip().startswith("["):
+            print(f"[ERROR] Claude returned JSON instead of plain text steps: {text[:100]}")
+            raise ValueError("Invalid format from Claude")
+        
+        steps = parse_steps(text)
+        
+        if steps:
+            print(f"[STEPS] Generated {len(steps)} steps with LLM")
+            return steps
+        else:
+            print(f"[STEPS] Failed to parse Claude's response, using fallback")
+            raise ValueError("No valid steps parsed")
+            
     except Exception as e:
-        print(f"[ERROR] Failed to generate steps: {e}")
+        print(f"[ERROR] Failed to generate steps with LLM: {e}")
+        # Fallback to generic steps
         return [
-            {"id": "1", "description": "Read and understand the problem", "rubric": ""},
-            {"id": "2", "description": "Identify relevant physics concepts", "rubric": ""},
-            {"id": "3", "description": "Set up equations", "rubric": ""},
-            {"id": "4", "description": "Solve", "rubric": ""},
+            {"id": "1", "description": "Identify the given data and what needs to be found", "rubric": ""},
+            {"id": "2", "description": "Determine which physics principles and formulas apply", "rubric": ""},
+            {"id": "3", "description": "Set up the equation with the given values", "rubric": ""},
+            {"id": "4", "description": "Solve for the unknown variable", "rubric": ""},
+            {"id": "5", "description": "Check units and verify the answer makes physical sense", "rubric": ""},
         ]
 
 # ==============================

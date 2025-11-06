@@ -24,7 +24,14 @@ FRONTEND_ORIGIN     = os.environ.get("FRONTEND_ORIGIN", "https://aiclub.com.mx")
 # Flask
 # ==============================
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": [FRONTEND_ORIGIN]}})
+CORS(app, resources={
+    r"/*": {
+        "origins": ["https://aiclub.com.mx", "http://aiclub.com.mx"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"],
+        "supports_credentials": False
+    }
+})
 
 # ==============================
 # Notion helpers

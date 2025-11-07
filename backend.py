@@ -343,6 +343,170 @@ def get_steps(problem_id: str):
         print(f"[ERROR] Failed to get steps: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.get("/solution/<problem_id>")
+def get_solution(problem_id: str):
+    """
+    Get the complete official solution for a problem.
+    Used when student chooses "View solution" option.
+    """
+    try:
+        problem = fetch_page(problem_id)
+        
+        # Get steps
+        steps_text = problem.get("step_by_step", "")
+        steps_list = parse_steps(steps_text) if steps_text else []
+        
+        # If no valid steps, generate with LLM
+        if not steps_list:
+            print(f"[SOLUTION] No valid steps found, generating with LLM...")
+            steps_list = generate_steps_with_llm(problem)
+        
+        # Build full solution text from steps
+        full_solution_lines = []
+        for i, step in enumerate(steps_list, 1):
+            full_solution_lines.append(f"{i}. {step.get('description', step.get('text', ''))}")
+        
+        full_solution = "\n\n".join(full_solution_lines)
+        
+        # Get final answer
+        final_answer = problem.get("final_answer", "")
+        
+        return jsonify({
+            "steps": steps_list,
+            "full_solution": full_solution,
+            "final_answer": final_answer,
+            "problem_title": problem.get("title") or problem.get("name", "")
+        })
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to get solution: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/submit-solution")
+def submit_solution():
+    """
+    Evaluate a student's complete solution to a problem.
+    Used in the new flow where student attempts the problem solo first.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    problem_id = data.get("problem_id")
+    solution_text = (data.get("solution_text") or "").strip()
+    solution_image_base64 = data.get("solution_image_base64")  # For future Phase 3
+    time_spent_seconds = data.get("time_spent_seconds", 0)
+    
+    print(f"[SUBMIT] problem_id={problem_id}, time={time_spent_seconds}s")
+    
+    if not problem_id:
+        return jsonify({"error": "missing problem_id"}), 400
+    
+    if not solution_text and not solution_image_base64:
+        return jsonify({"error": "No solution provided"}), 400
+    
+    # Fetch problem
+    try:
+        problem = fetch_page(problem_id)
+    except Exception as e:
+        return jsonify({"error": f"Cannot read problem: {e}"}), 500
+    
+    # Get official answer
+    official_answer = problem.get("final_answer", "")
+    problem_statement = problem.get("statement", "")
+    problem_title = problem.get("title") or problem.get("name", "")
+    
+    # Check if AI is available
+    if not ANTHROPIC_API_KEY:
+        # Fallback: basic length check
+        is_correct = len(solution_text) > 50
+        return jsonify({
+            "correct": is_correct,
+            "score": 50 if is_correct else 0,
+            "feedback": "AI evaluation not available. Your answer was recorded.",
+            "time_taken": f"{time_spent_seconds // 60}:{time_spent_seconds % 60:02d}"
+        })
+    
+    # Build evaluation prompt
+    eval_prompt = f"""You are an IB Physics HL examiner evaluating a student's complete solution.
+
+Problem: {problem_title}
+Statement: {problem_statement}
+
+Official Answer: {official_answer}
+
+Student's Solution:
+{solution_text}
+
+Evaluate the student's solution:
+1. Is the final answer correct? (yes/no)
+2. Is the reasoning/methodology correct?
+3. What did they do well?
+4. What mistakes did they make (if any)?
+
+Respond with ONLY valid JSON (no markdown, no code blocks):
+{{
+  "correct": true/false,
+  "score": 0-100,
+  "feedback": "Brief encouraging feedback (2-3 sentences)",
+  "specific_mistakes": ["mistake 1", "mistake 2"] or []
+}}
+
+Be encouraging even if wrong. Focus on what they can improve."""
+    
+    try:
+        response_text = call_anthropic_api(eval_prompt, max_tokens=1024)
+        
+        # Clean response
+        response_text = response_text.strip()
+        
+        # Remove markdown if present
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0]
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0]
+        
+        response_text = response_text.strip()
+        
+        # Extract JSON with regex
+        json_match = re.search(r'\{[^{}]*"correct"[^{}]*\}', response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(0)
+        
+        # Parse JSON
+        try:
+            parsed = json.loads(response_text)
+        except json.JSONDecodeError as je:
+            print(f"[ERROR] JSON parse failed: {je}")
+            print(f"[ERROR] Response was: {response_text[:200]}")
+            # Fallback
+            parsed = {
+                "correct": False,
+                "score": 30,
+                "feedback": "Your solution was recorded. Consider reviewing the key concepts and trying again.",
+                "specific_mistakes": []
+            }
+        
+        # Format time
+        minutes = time_spent_seconds // 60
+        seconds = time_spent_seconds % 60
+        time_str = f"{minutes}:{seconds:02d}"
+        
+        return jsonify({
+            "correct": bool(parsed.get("correct", False)),
+            "score": int(parsed.get("score", 0)),
+            "feedback": parsed.get("feedback", ""),
+            "specific_mistakes": parsed.get("specific_mistakes", []),
+            "time_taken": time_str
+        })
+        
+    except Exception as e:
+        print(f"[ERROR] Evaluation failed: {e}")
+        return jsonify({
+            "correct": False,
+            "score": 0,
+            "feedback": f"Error evaluating solution: {str(e)[:100]}",
+            "specific_mistakes": [],
+            "time_taken": f"{time_spent_seconds // 60}:{time_spent_seconds % 60:02d}"
+        }), 500
+
 @app.post("/chat")
 def chat():
     """

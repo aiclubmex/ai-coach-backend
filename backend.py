@@ -391,15 +391,16 @@ def submit_solution():
     data = request.get_json(force=True, silent=True) or {}
     problem_id = data.get("problem_id")
     solution_text = (data.get("solution_text") or "").strip()
-    solution_image_base64 = data.get("solution_image_base64")  # For future Phase 3
+    solution_image = data.get("solution_image")  # NEW: Image in base64
     time_spent_seconds = data.get("time_spent_seconds", 0)
     
-    print(f"[SUBMIT] problem_id={problem_id}, time={time_spent_seconds}s")
+    print(f"[SUBMIT] problem_id={problem_id}, time={time_spent_seconds}s, has_image={bool(solution_image)}")
     
     if not problem_id:
         return jsonify({"error": "missing problem_id"}), 400
     
-    if not solution_text and not solution_image_base64:
+    # NEW: Accept either text OR image
+    if not solution_text and not solution_image:
         return jsonify({"error": "No solution provided"}), 400
     
     # Fetch problem
@@ -412,11 +413,13 @@ def submit_solution():
     official_answer = problem.get("final_answer", "")
     problem_statement = problem.get("statement", "")
     problem_title = problem.get("title") or problem.get("name", "")
+    problem_given = problem.get("given_values", "")
+    problem_find = problem.get("find", "")
     
     # Check if AI is available
     if not ANTHROPIC_API_KEY:
         # Fallback: basic length check
-        is_correct = len(solution_text) > 50
+        is_correct = len(solution_text) > 50 or bool(solution_image)
         return jsonify({
             "correct": is_correct,
             "score": 50 if is_correct else 0,
@@ -424,11 +427,63 @@ def submit_solution():
             "time_taken": f"{time_spent_seconds // 60}:{time_spent_seconds % 60:02d}"
         })
     
-    # Build evaluation prompt
+    # NEW: Use different evaluation based on whether there's an image
+    try:
+        if solution_image:
+            # Evaluate with image using Vision API
+            evaluation = evaluate_solution_with_image(
+                problem_title=problem_title,
+                problem_statement=problem_statement,
+                problem_given=problem_given,
+                problem_find=problem_find,
+                solution_text=solution_text,
+                solution_image=solution_image,
+                official_answer=official_answer
+            )
+        else:
+            # Evaluate text-only (existing logic)
+            evaluation = evaluate_solution_with_text(
+                problem_title=problem_title,
+                problem_statement=problem_statement,
+                problem_given=problem_given,
+                problem_find=problem_find,
+                solution_text=solution_text,
+                official_answer=official_answer
+            )
+        
+        # Format time
+        minutes = time_spent_seconds // 60
+        seconds = time_spent_seconds % 60
+        time_str = f"{minutes}:{seconds:02d}"
+        
+        return jsonify({
+            "correct": bool(evaluation.get("correct", False)),
+            "score": int(evaluation.get("score", 0)),
+            "feedback": evaluation.get("feedback", ""),
+            "specific_mistakes": evaluation.get("specific_mistakes", []),
+            "time_taken": time_str
+        })
+        
+    except Exception as e:
+        print(f"[ERROR] Evaluation failed: {e}")
+        return jsonify({
+            "correct": False,
+            "score": 0,
+            "feedback": f"Error evaluating solution: {str(e)[:100]}",
+            "specific_mistakes": [],
+            "time_taken": f"{time_spent_seconds // 60}:{time_spent_seconds % 60:02d}"
+        }), 500
+
+def evaluate_solution_with_text(problem_title, problem_statement, problem_given, problem_find, solution_text, official_answer):
+    """
+    Evaluate a text-only solution (existing logic extracted into function)
+    """
     eval_prompt = f"""You are an IB Physics HL examiner evaluating a student's complete solution.
 
 Problem: {problem_title}
 Statement: {problem_statement}
+Given: {problem_given}
+Find: {problem_find}
 
 Official Answer: {official_answer}
 
@@ -451,8 +506,132 @@ Respond with ONLY valid JSON (no markdown, no code blocks):
 
 Be encouraging even if wrong. Focus on what they can improve."""
     
+    response_text = call_anthropic_api(eval_prompt, max_tokens=1024)
+    
+    # Clean response
+    response_text = response_text.strip()
+    
+    # Remove markdown if present
+    if "```json" in response_text:
+        response_text = response_text.split("```json")[1].split("```")[0]
+    elif "```" in response_text:
+        response_text = response_text.split("```")[1].split("```")[0]
+    
+    response_text = response_text.strip()
+    
+    # Extract JSON with regex
+    json_match = re.search(r'\{[^{}]*"correct"[^{}]*\}', response_text, re.DOTALL)
+    if json_match:
+        response_text = json_match.group(0)
+    
+    # Parse JSON
     try:
-        response_text = call_anthropic_api(eval_prompt, max_tokens=1024)
+        parsed = json.loads(response_text)
+    except json.JSONDecodeError as je:
+        print(f"[ERROR] JSON parse failed: {je}")
+        print(f"[ERROR] Response was: {response_text[:200]}")
+        # Fallback
+        parsed = {
+            "correct": False,
+            "score": 30,
+            "feedback": "Your solution was recorded. Consider reviewing the key concepts and trying again.",
+            "specific_mistakes": []
+        }
+    
+    return parsed
+
+def evaluate_solution_with_image(problem_title, problem_statement, problem_given, problem_find, solution_text, solution_image, official_answer):
+    """
+    NEW: Evaluate a solution that includes an image using Claude's Vision API
+    """
+    try:
+        # Extract base64 data (remove data:image/...;base64, prefix if present)
+        if 'base64,' in solution_image:
+            image_data = solution_image.split('base64,')[1]
+        else:
+            image_data = solution_image
+        
+        # Determine media type from the prefix
+        media_type = "image/jpeg"  # default
+        if solution_image.startswith('data:image/png'):
+            media_type = "image/png"
+        elif solution_image.startswith('data:image/webp'):
+            media_type = "image/webp"
+        
+        # Build evaluation prompt
+        eval_prompt = f"""You are an IB Physics HL examiner evaluating a student's solution.
+
+Problem: {problem_title}
+Statement: {problem_statement}
+Given: {problem_given}
+Find: {problem_find}
+
+Official Answer: {official_answer}
+
+The student has provided an image of their written solution.
+{"Additional text: " + solution_text if solution_text else "No additional text provided."}
+
+Please analyze the image carefully and evaluate the solution:
+1. Is the final answer correct? (yes/no)
+2. Is the reasoning/methodology correct?
+3. Can you read the student's work clearly?
+4. What did they do well?
+5. What mistakes did they make (if any)?
+
+Respond with ONLY valid JSON (no markdown, no code blocks):
+{{
+  "correct": true/false,
+  "score": 0-100,
+  "feedback": "Brief encouraging feedback about their work (2-3 sentences)",
+  "specific_mistakes": ["mistake 1", "mistake 2"] or []
+}}
+
+Be encouraging even if wrong. Focus on what they can improve."""
+        
+        # Call Anthropic API with Vision
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 2000,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_data
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": eval_prompt
+                    }
+                ]
+            }]
+        }
+        
+        print(f"[IMAGE] Calling Anthropic Vision API...")
+        resp = requests.post(url, headers=headers, json=payload, timeout=90)
+        
+        print(f"[IMAGE] Status: {resp.status_code}")
+        
+        if resp.status_code != 200:
+            error_data = resp.json() if resp.text else {}
+            error_msg = error_data.get("error", {}).get("message", resp.text)
+            raise Exception(f"Vision API error: {error_msg}")
+        
+        data = resp.json()
+        response_text = data.get("content", [{}])[0].get("text", "")
+        
+        print(f"[IMAGE] Response: {response_text[:200]}")
         
         # Clean response
         response_text = response_text.strip()
@@ -479,33 +658,22 @@ Be encouraging even if wrong. Focus on what they can improve."""
             # Fallback
             parsed = {
                 "correct": False,
-                "score": 30,
-                "feedback": "Your solution was recorded. Consider reviewing the key concepts and trying again.",
+                "score": 40,
+                "feedback": "I could see your work in the image. Try to explain your reasoning more clearly in your next attempt.",
                 "specific_mistakes": []
             }
         
-        # Format time
-        minutes = time_spent_seconds // 60
-        seconds = time_spent_seconds % 60
-        time_str = f"{minutes}:{seconds:02d}"
-        
-        return jsonify({
-            "correct": bool(parsed.get("correct", False)),
-            "score": int(parsed.get("score", 0)),
-            "feedback": parsed.get("feedback", ""),
-            "specific_mistakes": parsed.get("specific_mistakes", []),
-            "time_taken": time_str
-        })
+        return parsed
         
     except Exception as e:
-        print(f"[ERROR] Evaluation failed: {e}")
-        return jsonify({
+        print(f"[ERROR] Image evaluation failed: {e}")
+        # Fallback response
+        return {
             "correct": False,
             "score": 0,
-            "feedback": f"Error evaluating solution: {str(e)[:100]}",
-            "specific_mistakes": [],
-            "time_taken": f"{time_spent_seconds // 60}:{time_spent_seconds % 60:02d}"
-        }), 500
+            "feedback": f"Error evaluating image: {str(e)[:100]}. Please try uploading a clearer image or writing your solution as text.",
+            "specific_mistakes": []
+        }
 
 @app.post("/chat")
 def chat():

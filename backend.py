@@ -576,6 +576,8 @@ def submit_solution():
     try:
         if solution_image:
             # Evaluate with image using Vision API
+            print(f"[IMAGE] Evaluating solution with Vision API")
+            
             evaluation = evaluate_solution_with_image(
                 problem_title=problem_title,
                 problem_statement=problem_statement,
@@ -1012,3 +1014,4 @@ Rules:
 # ==============================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+

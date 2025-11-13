@@ -160,6 +160,77 @@ def parse_steps(text: str) -> List[Dict[str, str]]:
     return steps
 
 # ==============================
+# NEW: Notion Blocks API helpers
+# ==============================
+def fetch_page_blocks(page_id: str) -> List[Dict[str, Any]]:
+    """
+    Retrieve all blocks (content) from a Notion page.
+    This includes toggles, paragraphs, etc.
+    """
+    pid = sanitize_uuid(page_id)
+    if not pid:
+        raise ValueError("Invalid page ID")
+    
+    url = f"{NOTION_BASE}/blocks/{pid}/children"
+    
+    all_blocks = []
+    has_more = True
+    start_cursor = None
+    
+    while has_more:
+        params = {}
+        if start_cursor:
+            params["start_cursor"] = start_cursor
+        
+        resp = requests.get(url, headers=NOTION_HEADERS, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        all_blocks.extend(data.get("results", []))
+        has_more = data.get("has_more", False)
+        start_cursor = data.get("next_cursor")
+    
+    return all_blocks
+
+def extract_text_from_rich_text(rich_text_array):
+    """Extract plain text from Notion's rich_text format."""
+    if not rich_text_array:
+        return ""
+    return "".join([item.get("plain_text", "") for item in rich_text_array])
+
+def parse_steps_from_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """
+    Parse step-by-step solution from Notion blocks (toggles).
+    Looks for toggle blocks that start with "Step X:" or similar.
+    """
+    steps = []
+    step_counter = 1
+    
+    for block in blocks:
+        block_type = block.get("type")
+        
+        # Check if it's a toggle block
+        if block_type == "toggle":
+            toggle_data = block.get("toggle", {})
+            rich_text = toggle_data.get("rich_text", [])
+            text = extract_text_from_rich_text(rich_text)
+            
+            # Check if it looks like a step (starts with "Step" or is numbered)
+            if text and (text.lower().startswith("step") or any(text.startswith(f"{n}.") for n in range(1, 20))):
+                # Remove "Step X:" prefix if present
+                clean_text = re.sub(r'^(Step\s+\d+:\s*)', '', text, flags=re.IGNORECASE).strip()
+                
+                if clean_text and len(clean_text) > 5:
+                    steps.append({
+                        "id": str(step_counter),
+                        "description": clean_text,
+                        "rubric": ""
+                    })
+                    step_counter += 1
+    
+    return steps
+
+# ==============================
 # Anthropic helper with improved error handling
 # ==============================
 def call_anthropic_api(prompt: str, max_tokens: int = 1024) -> str:
@@ -325,18 +396,30 @@ def get_problem(problem_id: str):
 @app.get("/steps/<problem_id>")
 def get_steps(problem_id: str):
     try:
+        # Get page properties
         page = fetch_page(problem_id)
-        steps_text = page.get("step_by_step", "")
         
-        # Try to parse steps from Notion
+        # Try to get steps from blocks (toggles) - NEW METHOD
+        try:
+            blocks = fetch_page_blocks(problem_id)
+            steps = parse_steps_from_blocks(blocks)
+            
+            if steps:
+                print(f"[STEPS] Found {len(steps)} steps from Notion blocks (toggles)")
+                return jsonify({"steps": steps})
+        except Exception as e:
+            print(f"[STEPS] Could not read blocks: {e}")
+        
+        # Fallback: try old method from text field
+        steps_text = page.get("step_by_step", "")
         steps = parse_steps(steps_text) if steps_text else []
         
-        # If no valid steps found, generate with LLM
+        # If still no valid steps, generate with LLM
         if not steps:
             print(f"[STEPS] No valid steps in Notion, generating with LLM...")
             steps = generate_steps_with_llm(page)
         else:
-            print(f"[STEPS] Found {len(steps)} steps from Notion")
+            print(f"[STEPS] Found {len(steps)} steps from Notion text field")
         
         return jsonify({"steps": steps})
     except Exception as e:
@@ -352,11 +435,23 @@ def get_solution(problem_id: str):
     try:
         problem = fetch_page(problem_id)
         
-        # Get steps
-        steps_text = problem.get("step_by_step", "")
-        steps_list = parse_steps(steps_text) if steps_text else []
+        # Try to get steps from blocks (toggles) - NEW METHOD
+        steps_list = []
+        try:
+            blocks = fetch_page_blocks(problem_id)
+            steps_list = parse_steps_from_blocks(blocks)
+            
+            if steps_list:
+                print(f"[SOLUTION] Found {len(steps_list)} steps from Notion blocks (toggles)")
+        except Exception as e:
+            print(f"[SOLUTION] Could not read blocks: {e}")
         
-        # If no valid steps, generate with LLM
+        # Fallback: try old method
+        if not steps_list:
+            steps_text = problem.get("step_by_step", "")
+            steps_list = parse_steps(steps_text) if steps_text else []
+        
+        # If still no valid steps, generate with LLM
         if not steps_list:
             print(f"[SOLUTION] No valid steps found, generating with LLM...")
             steps_list = generate_steps_with_llm(problem)

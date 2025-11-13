@@ -687,10 +687,61 @@ Be encouraging even if wrong. Focus on what they can improve."""
     
     return parsed
 
+def resize_image_if_needed(base64_data, max_size=1500000):
+    """
+    Resize image if base64 data is too large.
+    Anthropic API has limits on image size.
+    """
+    try:
+        # If image is small enough, return as is
+        if len(base64_data) <= max_size:
+            return base64_data
+        
+        print(f"[IMAGE] Image too large ({len(base64_data)} chars), resizing...")
+        
+        # Decode base64 to bytes
+        import base64
+        from PIL import Image
+        from io import BytesIO
+        
+        image_bytes = base64.b64decode(base64_data)
+        image = Image.open(BytesIO(image_bytes))
+        
+        # Calculate new size (reduce by 50%)
+        original_size = image.size
+        new_size = (int(original_size[0] * 0.5), int(original_size[1] * 0.5))
+        
+        print(f"[IMAGE] Resizing from {original_size} to {new_size}")
+        
+        # Resize
+        resized_image = image.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # Convert back to base64
+        buffered = BytesIO()
+        resized_image.save(buffered, format="JPEG", quality=85)
+        resized_bytes = buffered.getvalue()
+        resized_base64 = base64.b64encode(resized_bytes).decode('utf-8')
+        
+        print(f"[IMAGE] Resized to {len(resized_base64)} chars")
+        
+        # If still too large, try again with lower quality
+        if len(resized_base64) > max_size:
+            buffered = BytesIO()
+            resized_image.save(buffered, format="JPEG", quality=60)
+            resized_bytes = buffered.getvalue()
+            resized_base64 = base64.b64encode(resized_bytes).decode('utf-8')
+            print(f"[IMAGE] Further compressed to {len(resized_base64)} chars")
+        
+        return resized_base64
+        
+    except Exception as e:
+        print(f"[IMAGE] Resize failed: {e}, using original")
+        return base64_data
+
 def evaluate_solution_with_image(problem_title, problem_statement, problem_given, problem_find, solution_text, solution_image, official_answer):
     """
     NEW: Evaluate a solution that includes an image using Claude's Vision API
-    FIXED: Detect media type BEFORE splitting base64
+    FIXED: Detect media type BEFORE splitting base64 + Auto-resize large images
     """
     try:
         # Determine media type FIRST (before splitting) - THIS IS THE FIX
@@ -713,6 +764,9 @@ def evaluate_solution_with_image(problem_title, problem_statement, problem_given
         else:
             image_data = solution_image
             print(f"[IMAGE] Using raw data, length: {len(image_data)}")
+        
+        # NEW: Resize if too large
+        image_data = resize_image_if_needed(image_data)
         
         # Build evaluation prompt
         eval_prompt = f"""You are an IB Physics HL examiner evaluating a student's solution.

@@ -202,6 +202,7 @@ def parse_steps_from_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, str]
     """
     Parse step-by-step solution from Notion blocks (toggles).
     Looks for toggle blocks that start with "Step X:" or similar.
+    Reads the content INSIDE each toggle (children blocks).
     """
     steps = []
     step_counter = 1
@@ -213,17 +214,66 @@ def parse_steps_from_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, str]
         if block_type == "toggle":
             toggle_data = block.get("toggle", {})
             rich_text = toggle_data.get("rich_text", [])
-            text = extract_text_from_rich_text(rich_text)
+            title_text = extract_text_from_rich_text(rich_text)
             
             # Check if it looks like a step (starts with "Step" or is numbered)
-            if text and (text.lower().startswith("step") or any(text.startswith(f"{n}.") for n in range(1, 20))):
+            if title_text and (title_text.lower().startswith("step") or any(title_text.startswith(f"{n}.") for n in range(1, 20))):
                 # Remove "Step X:" prefix if present
-                clean_text = re.sub(r'^(Step\s+\d+:\s*)', '', text, flags=re.IGNORECASE).strip()
+                clean_title = re.sub(r'^(Step\s+\d+:\s*)', '', title_text, flags=re.IGNORECASE).strip()
                 
-                if clean_text and len(clean_text) > 5:
+                # Now we need to get the CONTENT inside the toggle (children blocks)
+                # Check if toggle has children
+                has_children = block.get("has_children", False)
+                block_id = block.get("id", "")
+                
+                content_lines = []
+                
+                if has_children and block_id:
+                    # Fetch the children blocks of this toggle
+                    try:
+                        children_url = f"{NOTION_BASE}/blocks/{block_id}/children"
+                        children_resp = requests.get(children_url, headers=NOTION_HEADERS, timeout=10)
+                        
+                        if children_resp.status_code == 200:
+                            children_data = children_resp.json()
+                            children_blocks = children_data.get("results", [])
+                            
+                            # Extract text from all children blocks
+                            for child_block in children_blocks:
+                                child_type = child_block.get("type")
+                                
+                                # Handle different block types
+                                if child_type == "paragraph":
+                                    para_data = child_block.get("paragraph", {})
+                                    para_text = extract_text_from_rich_text(para_data.get("rich_text", []))
+                                    if para_text.strip():
+                                        content_lines.append(para_text)
+                                
+                                elif child_type == "bulleted_list_item":
+                                    bullet_data = child_block.get("bulleted_list_item", {})
+                                    bullet_text = extract_text_from_rich_text(bullet_data.get("rich_text", []))
+                                    if bullet_text.strip():
+                                        content_lines.append("- " + bullet_text)
+                                
+                                elif child_type == "numbered_list_item":
+                                    numbered_data = child_block.get("numbered_list_item", {})
+                                    numbered_text = extract_text_from_rich_text(numbered_data.get("rich_text", []))
+                                    if numbered_text.strip():
+                                        content_lines.append("- " + numbered_text)
+                    
+                    except Exception as e:
+                        print(f"[WARN] Could not fetch children for block {block_id}: {e}")
+                
+                # Build the full step description: title + content
+                if content_lines:
+                    full_description = clean_title + "\n\n" + "\n".join(content_lines)
+                else:
+                    full_description = clean_title
+                
+                if full_description and len(full_description.strip()) > 5:
                     steps.append({
                         "id": str(step_counter),
-                        "description": clean_text,
+                        "description": full_description,
                         "rubric": ""
                     })
                     step_counter += 1

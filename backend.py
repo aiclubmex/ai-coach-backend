@@ -543,20 +543,29 @@ Be encouraging even if wrong. Focus on what they can improve."""
 def evaluate_solution_with_image(problem_title, problem_statement, problem_given, problem_find, solution_text, solution_image, official_answer):
     """
     NEW: Evaluate a solution that includes an image using Claude's Vision API
+    FIXED: Detect media type BEFORE splitting base64
     """
     try:
+        # Determine media type FIRST (before splitting) - THIS IS THE FIX
+        media_type = "image/jpeg"  # default
+        if 'image/png' in solution_image:
+            media_type = "image/png"
+        elif 'image/jpeg' in solution_image or 'image/jpg' in solution_image:
+            media_type = "image/jpeg"
+        elif 'image/webp' in solution_image:
+            media_type = "image/webp"
+        elif 'image/gif' in solution_image:
+            media_type = "image/gif"
+        
+        print(f"[IMAGE] Detected media type: {media_type}")
+        
         # Extract base64 data (remove data:image/...;base64, prefix if present)
         if 'base64,' in solution_image:
             image_data = solution_image.split('base64,')[1]
+            print(f"[IMAGE] Extracted base64 data, length: {len(image_data)}")
         else:
             image_data = solution_image
-        
-        # Determine media type from the prefix
-        media_type = "image/jpeg"  # default
-        if solution_image.startswith('data:image/png'):
-            media_type = "image/png"
-        elif solution_image.startswith('data:image/webp'):
-            media_type = "image/webp"
+            print(f"[IMAGE] Using raw data, length: {len(image_data)}")
         
         # Build evaluation prompt
         eval_prompt = f"""You are an IB Physics HL examiner evaluating a student's solution.
@@ -672,6 +681,192 @@ Be encouraging even if wrong. Focus on what they can improve."""
             "correct": False,
             "score": 0,
             "feedback": f"Error evaluating image: {str(e)[:100]}. Please try uploading a clearer image or writing your solution as text.",
+            "specific_mistakes": []
+        }
+
+@app.post("/chat")
+def chat():
+    """
+    Handle student interactions:
+    - mode='tutor': Evaluate student's step answer
+    - mode='hint': Provide a hint
+    - mode='student': Free chat about the problem
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    problem_id = data.get("problem_id")
+    step_id = str(data.get("step_id") or "1")
+    student_answer = (data.get("student_answer") or "").strip()
+    mode = data.get("mode", "tutor")
+    message_text = data.get("message", "").strip()
+    
+    print(f"[CHAT] mode={mode}, problem_id={problem_id}, step_id={step_id}")
+    print(f"[CHAT] student_answer={student_answer[:100]}")
+    print(f"[CHAT] message={message_text[:100]}")
+    
+    if not problem_id:
+        return jsonify({"error": "missing problem_id"}), 400
+    
+    # Fetch problem
+    try:
+        problem = fetch_page(problem_id)
+    except Exception as e:
+        return jsonify({"error": f"Cannot read problem: {e}"}), 500
+    
+    # Get steps
+    steps_text = problem.get("step_by_step", "")
+    steps_list = parse_steps(steps_text) if steps_text else []
+    
+    # If no valid steps, generate with LLM
+    if not steps_list:
+        print(f"[CHAT] No valid steps found, generating with LLM...")
+        steps_list = generate_steps_with_llm(problem)
+    
+    # Find current step
+    current_step = None
+    for s in steps_list:
+        if s["id"] == step_id:
+            current_step = s
+            break
+    
+    if not current_step and steps_list:
+        current_step = steps_list[0]
+        step_id = current_step["id"]
+    
+    # Check if API is available
+    if not ANTHROPIC_API_KEY:
+        return jsonify({
+            "ok": True,
+            "feedback": "AI Coach is not configured. Your answer was recorded.",
+            "next_step": str(int(step_id) + 1) if step_id.isdigit() else step_id,
+            "message": "Continue to next step.",
+            "reply": "AI Coach is not configured."
+        })
+    
+    # MODE: Free chat (student asking questions)
+    if mode == "student" and message_text:
+        prompt = f"""You are an IB Physics tutor helping with this problem:
+
+Problem: {problem.get('title', '')}
+Statement: {problem.get('statement', '')}
+
+Student asks: {message_text}
+
+Provide a brief, helpful response (2-3 sentences). Guide them towards understanding without giving the full answer."""
+        
+        try:
+            reply = call_anthropic_api(prompt, max_tokens=256)
+            return jsonify({"reply": reply.strip()})
+        except Exception as e:
+            print(f"[ERROR] Free chat failed: {e}")
+            return jsonify({"reply": f"Sorry, I encountered an error: {str(e)[:100]}"})
+    
+    # MODE: Hint
+    if mode == "hint":
+        prompt = f"""You are an IB Physics tutor. Provide a helpful hint for this step.
+
+Problem: {problem.get('title', '')}
+Current Step: {current_step.get('description', '')}
+
+Provide ONE specific hint (1-2 sentences) that guides the student without giving the answer directly."""
+        
+        try:
+            hint = call_anthropic_api(prompt, max_tokens=256)
+            return jsonify({"hint": hint.strip()})
+        except Exception as e:
+            print(f"[ERROR] Hint failed: {e}")
+            return jsonify({"hint": f"Try to think about the physics concepts involved in: {current_step.get('description', '')}"})
+    
+    # MODE: Tutor (evaluate answer)
+    if not student_answer:
+        return jsonify({
+            "ok": False,
+            "feedback": "Please provide an answer to evaluate.",
+            "next_step": step_id,
+            "message": "Write your reasoning above."
+        })
+    
+    # Build evaluation prompt
+    eval_prompt = f"""You are an IB Physics tutor evaluating a student's step.
+
+Problem: {problem.get('title', '')}
+Step: {current_step.get('description', '')}
+Student's Answer: {student_answer}
+
+Evaluate if the student's reasoning is correct for this step.
+
+Respond with ONLY valid JSON (no markdown, no explanations):
+{{
+  "ok": true/false,
+  "feedback": "brief feedback message",
+  "ready_to_advance": true/false,
+  "next_hint": "hint if needed, or empty string"
+}}
+
+Rules:
+- ok: true if answer shows understanding of the step
+- feedback: 1-2 sentences about their answer
+- ready_to_advance: true if they can move to next step
+- next_hint: suggest what to include if incomplete"""
+    
+    try:
+        response_text = call_anthropic_api(eval_prompt, max_tokens=512)
+        
+        # Clean response
+        response_text = response_text.strip()
+        
+        # Remove markdown if present
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0]
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0]
+        
+        response_text = response_text.strip()
+        
+        # Try to extract JSON with regex
+        json_match = re.search(r'\{[^{}]*"ok"[^{}]*"feedback"[^{}]*\}', response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(0)
+        
+        # Parse JSON
+        try:
+            parsed = json.loads(response_text)
+        except json.JSONDecodeError as je:
+            print(f"[ERROR] JSON parse failed: {je}")
+            print(f"[ERROR] Response was: {response_text[:200]}")
+            # Fallback response
+            parsed = {
+                "ok": len(student_answer) > 15,
+                "feedback": "Your answer was recorded. Try to be more specific with physics concepts.",
+                "ready_to_advance": len(student_answer) > 15,
+                "next_hint": "Explain which formulas or principles apply."
+            }
+        
+        # Determine next step
+        can_advance = bool(parsed.get("ready_to_advance") or parsed.get("ok"))
+        next_step = str(int(step_id) + 1) if (can_advance and step_id.isdigit()) else step_id
+        message = parsed.get("next_hint", "") if not can_advance else "Great! Continue to the next step."
+        
+        return jsonify({
+            "ok": can_advance,
+            "feedback": parsed.get("feedback", ""),
+            "next_step": next_step,
+            "message": message
+        })
+        
+    except Exception as e:
+        print(f"[ERROR] Evaluation failed: {e}")
+        return jsonify({
+            "ok": False,
+            "feedback": f"Error: {str(e)[:100]}",
+            "next_step": step_id,
+            "message": "Please try again."
+        }), 500
+
+# ==============================
+# Gunicorn entry
+# ==============================
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
             "specific_mistakes": []
         }
 

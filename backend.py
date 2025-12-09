@@ -1,7 +1,7 @@
 # backend.py
 # Flask API for Physics AI Coach
 # - GET /                -> health
-# - GET /problems        -> list problems from Notion
+# - GET /problems        -> list problems from Notion (NOW FULLY PAGINATED)
 # - GET /problem/<id>    -> full fields for one problem
 # - GET /steps/<id>      -> step-by-step plan (Notion or auto-LLM)
 # - POST /chat           -> checks a student's step / next hint
@@ -90,23 +90,42 @@ def fetch_page(page_id: str) -> Dict[str, Any]:
     
     return out
 
+# ====================================================================
+# *** CAMBIO BLINDADO CRÍTICO: IMPLEMENTACIÓN DE PAGINACIÓN COMPLETA ***
+# ====================================================================
+
 def query_database(database_id: str, filter_obj: dict = None) -> List[Dict[str, Any]]:
-    """Query a Notion database."""
+    """Query a Notion database with full pagination (brings ALL results)."""
     db_id = sanitize_uuid(database_id)
     if not db_id:
         raise ValueError("Invalid database ID")
     
     url = f"{NOTION_BASE}/databases/{db_id}/query"
-    payload = {}
-    if filter_obj:
-        payload["filter"] = filter_obj
     
-    resp = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
+    all_pages = []
+    has_more = True
+    start_cursor = None
     
+    while has_more:
+        payload = {}
+        if filter_obj:
+            payload["filter"] = filter_obj
+        if start_cursor:
+            payload["start_cursor"] = start_cursor # <- Clave para la paginación
+
+        # Nota: page_size es 100 por defecto si no se incluye.
+        
+        resp = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=15) # Aumenté el timeout
+        resp.raise_for_status()
+        data = resp.json()
+        
+        all_pages.extend(data.get("results", []))
+        has_more = data.get("has_more", False)
+        start_cursor = data.get("next_cursor")
+    
+    # Después de traer todas las páginas, procesamos las propiedades
     results = []
-    for page in data.get("results", []):
+    for page in all_pages: # <- Usamos all_pages, que contiene todo
         pid = page.get("id", "")
         props = page.get("properties", {})
         obj = {"id": pid}
@@ -128,6 +147,11 @@ def query_database(database_id: str, filter_obj: dict = None) -> List[Dict[str, 
         results.append(obj)
     
     return results
+
+# ====================================================================
+# *** FIN DEL CAMBIO BLINDADO CRÍTICO ***
+# ====================================================================
+
 
 def parse_steps(text: str) -> List[Dict[str, str]]:
     """Parse step-by-step text into structured steps."""
@@ -430,6 +454,7 @@ def list_problems():
     if not NOTION_DB_ID:
         return jsonify({"error": "NOTION_DATABASE_ID not set"}), 500
     try:
+        # Llama a la función ahora paginada
         items = query_database(NOTION_DB_ID)
         return jsonify({"problems": items})
     except Exception as e:
@@ -450,13 +475,14 @@ def get_steps(problem_id: str):
         page = fetch_page(problem_id)
         
         # Try to get steps from blocks (toggles) - NEW METHOD
+        steps_list = []
         try:
             blocks = fetch_page_blocks(problem_id)
-            steps = parse_steps_from_blocks(blocks)
+            steps_list = parse_steps_from_blocks(blocks)
             
-            if steps:
-                print(f"[STEPS] Found {len(steps)} steps from Notion blocks (toggles)")
-                return jsonify({"steps": steps})
+            if steps_list:
+                print(f"[STEPS] Found {len(steps_list)} steps from Notion blocks (toggles)")
+                return jsonify({"steps": steps_list})
         except Exception as e:
             print(f"[STEPS] Could not read blocks: {e}")
         
@@ -839,7 +865,14 @@ Be encouraging even if wrong. Focus on what they can improve."""
             raise Exception(f"Vision API error: {error_msg}")
         
         data = resp.json()
-        response_text = data.get("content", [{}])[0].get("text", "")
+        content = data.get("content", [{}])[0].get("text", "")
+        
+        print(f"[IMAGE] Response: {response_text[:200]}")
+        
+        if content:
+            response_text = content[0].get("text", "")
+        else:
+            response_text = ""
         
         print(f"[IMAGE] Response: {response_text[:200]}")
         
@@ -914,14 +947,23 @@ def chat():
         return jsonify({"error": f"Cannot read problem: {e}"}), 500
     
     # Get steps
-    steps_text = problem.get("step_by_step", "")
-    steps_list = parse_steps(steps_text) if steps_text else []
+    steps_list = []
+    try:
+        blocks = fetch_page_blocks(problem_id)
+        steps_list = parse_steps_from_blocks(blocks)
+    except Exception as e:
+        print(f"[CHAT] Could not read blocks: {e}")
     
+    if not steps_list:
+        # Fallback: try old method from text field
+        steps_text = problem.get("step_by_step", "")
+        steps_list = parse_steps(steps_text) if steps_text else []
+
     # If no valid steps, generate with LLM
     if not steps_list:
         print(f"[CHAT] No valid steps found, generating with LLM...")
         steps_list = generate_steps_with_llm(problem)
-    
+
     # Find current step
     current_step = None
     for s in steps_list:

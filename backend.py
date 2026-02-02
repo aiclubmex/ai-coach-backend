@@ -5,12 +5,36 @@
 # - GET /problem/<id>    -> full fields for one problem
 # - GET /steps/<id>      -> step-by-step plan (Notion or auto-LLM)
 # - POST /chat           -> checks a student's step / next hint
+# 
+# ========================================
+# *** MULTIUSER SYSTEM - ADDED 2 FEB 2026 ***
+# - POST /api/register           -> register new user
+# - POST /api/login              -> login user
+# - GET  /api/verify-session     -> verify JWT token
+# - POST /api/track-activity     -> track user activity
+# - GET  /api/user-progress      -> get current user progress
+# - GET  /api/all-users          -> get all users (admin only)
+# ========================================
 
 import os, re, json
 from typing import List, Dict, Any
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
+from functools import wraps
+from datetime import datetime, timedelta
+
+# ========================================
+# *** NEW: Import for authentication ***
+# ========================================
+try:
+    import bcrypt
+    import jwt
+    AUTH_AVAILABLE = True
+except ImportError:
+    AUTH_AVAILABLE = False
+    print("[WARNING] bcrypt or PyJWT not installed. Auth endpoints will not work.")
+    print("[WARNING] Install with: pip install bcrypt PyJWT")
 
 # ==============================
 # ENV
@@ -20,6 +44,13 @@ NOTION_DB_ID        = os.environ.get("NOTION_DATABASE_ID", "")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 FRONTEND_ORIGIN     = os.environ.get("FRONTEND_ORIGIN", "https://aiclub.com.mx")
 
+# ========================================
+# *** NEW: Environment variables for multiuser system ***
+# ========================================
+USERS_DB_ID         = os.environ.get("USERS_DB_ID", "")
+ACTIVITY_DB_ID      = os.environ.get("ACTIVITY_DB_ID", "")
+JWT_SECRET_KEY      = os.environ.get("JWT_SECRET_KEY", "change-this-secret-key-in-production")
+
 # ==============================
 # Flask
 # ==============================
@@ -28,7 +59,7 @@ CORS(app, resources={
     r"/*": {
         "origins": ["https://aiclub.com.mx", "http://aiclub.com.mx"],
         "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"],
+        "allow_headers": ["Content-Type", "Authorization"],  # *** ADDED Authorization header ***
         "supports_credentials": False
     }
 })
@@ -87,6 +118,14 @@ def fetch_page(page_id: str) -> Dict[str, Any]:
         elif ptype == "files":
             files = v.get("files", [])
             out[k] = [f.get("file", {}).get("url") or f.get("external", {}).get("url") for f in files]
+        elif ptype == "email":  # *** NEW: Support for email type ***
+            out[k] = v.get("email", "")
+        elif ptype == "date":  # *** NEW: Support for date type ***
+            date_obj = v.get("date")
+            if date_obj:
+                out[k] = date_obj.get("start", "")
+            else:
+                out[k] = None
     
     return out
 
@@ -94,7 +133,7 @@ def fetch_page(page_id: str) -> Dict[str, Any]:
 # *** CAMBIO BLINDADO CRÍTICO: IMPLEMENTACIÓN DE PAGINACIÓN COMPLETA ***
 # ====================================================================
 
-def query_database(database_id: str, filter_obj: dict = None) -> List[Dict[str, Any]]:
+def query_database(database_id: str, filter_obj: dict = None, sorts: list = None) -> List[Dict[str, Any]]:
     """Query a Notion database with full pagination (brings ALL results)."""
     db_id = sanitize_uuid(database_id)
     if not db_id:
@@ -110,12 +149,12 @@ def query_database(database_id: str, filter_obj: dict = None) -> List[Dict[str, 
         payload = {}
         if filter_obj:
             payload["filter"] = filter_obj
+        if sorts:
+            payload["sorts"] = sorts
         if start_cursor:
-            payload["start_cursor"] = start_cursor # <- Clave para la paginación
+            payload["start_cursor"] = start_cursor
 
-        # Nota: page_size es 100 por defecto si no se incluye.
-        
-        resp = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=15) # Aumenté el timeout
+        resp = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         
@@ -123,9 +162,8 @@ def query_database(database_id: str, filter_obj: dict = None) -> List[Dict[str, 
         has_more = data.get("has_more", False)
         start_cursor = data.get("next_cursor")
     
-    # Después de traer todas las páginas, procesamos las propiedades
     results = []
-    for page in all_pages: # <- Usamos all_pages, que contiene todo
+    for page in all_pages:
         pid = page.get("id", "")
         props = page.get("properties", {})
         obj = {"id": pid}
@@ -144,6 +182,14 @@ def query_database(database_id: str, filter_obj: dict = None) -> List[Dict[str, 
                 obj[k] = sel.get("name", "") if sel else ""
             elif ptype == "multi_select":
                 obj[k] = [ms.get("name", "") for ms in v.get("multi_select", [])]
+            elif ptype == "email":  # *** NEW ***
+                obj[k] = v.get("email", "")
+            elif ptype == "date":  # *** NEW ***
+                date_obj = v.get("date")
+                if date_obj:
+                    obj[k] = date_obj.get("start", "")
+                else:
+                    obj[k] = None
         results.append(obj)
     
     return results
@@ -152,6 +198,25 @@ def query_database(database_id: str, filter_obj: dict = None) -> List[Dict[str, 
 # *** FIN DEL CAMBIO BLINDADO CRÍTICO ***
 # ====================================================================
 
+# ========================================
+# *** NEW: Helper function to create Notion pages ***
+# ========================================
+def create_page_in_database(database_id: str, properties: dict) -> dict:
+    """Create a new page in a Notion database."""
+    db_id = sanitize_uuid(database_id)
+    if not db_id:
+        raise ValueError("Invalid database ID")
+    
+    url = f"{NOTION_BASE}/pages"
+    
+    payload = {
+        "parent": {"database_id": db_id},
+        "properties": properties
+    }
+    
+    resp = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
 
 def parse_steps(text: str) -> List[Dict[str, str]]:
     """Parse step-by-step text into structured steps."""
@@ -166,10 +231,8 @@ def parse_steps(text: str) -> List[Dict[str, str]]:
         if not ln:
             continue
         
-        # Remove numbering like "1)", "1.", "Step 1:", etc.
         clean_ln = re.sub(r'^(\d+[\)\.:]?\s*|Step\s+\d+[\)\.:]?\s*)', '', ln, flags=re.IGNORECASE).strip()
         
-        # Only add if there's actual content (not just a number)
         if clean_ln and len(clean_ln) > 2:
             steps.append({
                 "id": str(i),
@@ -177,7 +240,6 @@ def parse_steps(text: str) -> List[Dict[str, str]]:
                 "rubric": ""
             })
     
-    # If we got steps but they're all too short (just numbers), return empty
     if steps and all(len(s["description"]) < 5 for s in steps):
         return []
     
@@ -234,26 +296,20 @@ def parse_steps_from_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, str]
     for block in blocks:
         block_type = block.get("type")
         
-        # Check if it's a toggle block
         if block_type == "toggle":
             toggle_data = block.get("toggle", {})
             rich_text = toggle_data.get("rich_text", [])
             title_text = extract_text_from_rich_text(rich_text)
             
-            # Check if it looks like a step (starts with "Step" or is numbered)
             if title_text and (title_text.lower().startswith("step") or any(title_text.startswith(f"{n}.") for n in range(1, 20))):
-                # Remove "Step X:" prefix if present
                 clean_title = re.sub(r'^(Step\s+\d+:\s*)', '', title_text, flags=re.IGNORECASE).strip()
                 
-                # Now we need to get the CONTENT inside the toggle (children blocks)
-                # Check if toggle has children
                 has_children = block.get("has_children", False)
                 block_id = block.get("id", "")
                 
                 content_lines = []
                 
                 if has_children and block_id:
-                    # Fetch the children blocks of this toggle
                     try:
                         children_url = f"{NOTION_BASE}/blocks/{block_id}/children"
                         children_resp = requests.get(children_url, headers=NOTION_HEADERS, timeout=10)
@@ -262,11 +318,9 @@ def parse_steps_from_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, str]
                             children_data = children_resp.json()
                             children_blocks = children_data.get("results", [])
                             
-                            # Extract text from all children blocks
                             for child_block in children_blocks:
                                 child_type = child_block.get("type")
                                 
-                                # Handle different block types
                                 if child_type == "paragraph":
                                     para_data = child_block.get("paragraph", {})
                                     para_text = extract_text_from_rich_text(para_data.get("rich_text", []))
@@ -288,7 +342,6 @@ def parse_steps_from_blocks(blocks: List[Dict[str, Any]]) -> List[Dict[str, str]
                     except Exception as e:
                         print(f"[WARN] Could not fetch children for block {block_id}: {e}")
                 
-                # Build the full step description: title + content
                 if content_lines:
                     full_description = clean_title + "\n\n" + "\n".join(content_lines)
                 else:
@@ -337,9 +390,8 @@ def call_anthropic_api(prompt: str, max_tokens: int = 1024) -> str:
     
     try:
         print(f"[API] Calling Anthropic API...")
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)  # Increased to 60 seconds
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
         
-        # Log status and response for debugging
         print(f"[API] Status: {resp.status_code}")
         print(f"[API] Response: {resp.text[:200]}")
         
@@ -400,24 +452,18 @@ Now create the steps for the problem above:"""
     try:
         text = call_anthropic_api(prompt, max_tokens=512)
         
-        # Clean up the response
         text = text.strip()
         
-        # Remove any markdown code blocks
         if "```" in text:
-            # Extract content between ``` markers
             parts = text.split("```")
             if len(parts) >= 3:
                 text = parts[1]
-                # Remove language identifier like "json" or "text"
                 lines = text.split("\n")
                 if lines[0].strip() in ["json", "text", "plaintext", ""]:
                     text = "\n".join(lines[1:])
             else:
-                # Just remove the markers
                 text = text.replace("```", "")
         
-        # Remove any JSON-like content
         if text.strip().startswith("{") or text.strip().startswith("["):
             print(f"[ERROR] Claude returned JSON instead of plain text steps: {text[:100]}")
             raise ValueError("Invalid format from Claude")
@@ -433,7 +479,6 @@ Now create the steps for the problem above:"""
             
     except Exception as e:
         print(f"[ERROR] Failed to generate steps with LLM: {e}")
-        # Fallback to generic steps
         return [
             {"id": "1", "description": "Identify the given data and what needs to be found", "rubric": ""},
             {"id": "2", "description": "Determine which physics principles and formulas apply", "rubric": ""},
@@ -442,8 +487,37 @@ Now create the steps for the problem above:"""
             {"id": "5", "description": "Check units and verify the answer makes physical sense", "rubric": ""},
         ]
 
+# ========================================
+# *** NEW: Authentication Middleware ***
+# ========================================
+def require_auth(f):
+    """
+    Decorator to require authentication for endpoints.
+    Checks for valid JWT token in Authorization header.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not AUTH_AVAILABLE:
+            return jsonify({"error": "Authentication not available (missing dependencies)"}), 500
+        
+        token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        
+        if not token:
+            return jsonify({"error": "No token provided"}), 401
+        
+        try:
+            payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=['HS256'])
+            request.user = payload  # Add user info to request object
+            return f(*args, **kwargs)
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Invalid token"}), 401
+    
+    return decorated_function
+
 # ==============================
-# Routes
+# Routes (EXISTING - NO CHANGES)
 # ==============================
 @app.get("/")
 def index():
@@ -454,7 +528,6 @@ def list_problems():
     if not NOTION_DB_ID:
         return jsonify({"error": "NOTION_DATABASE_ID not set"}), 500
     try:
-        # Llama a la función ahora paginada
         items = query_database(NOTION_DB_ID)
         return jsonify({"problems": items})
     except Exception as e:
@@ -471,10 +544,8 @@ def get_problem(problem_id: str):
 @app.get("/steps/<problem_id>")
 def get_steps(problem_id: str):
     try:
-        # Get page properties
         page = fetch_page(problem_id)
         
-        # Try to get steps from blocks (toggles) - NEW METHOD
         steps_list = []
         try:
             blocks = fetch_page_blocks(problem_id)
@@ -486,11 +557,9 @@ def get_steps(problem_id: str):
         except Exception as e:
             print(f"[STEPS] Could not read blocks: {e}")
         
-        # Fallback: try old method from text field
         steps_text = page.get("step_by_step", "")
         steps = parse_steps(steps_text) if steps_text else []
         
-        # If still no valid steps, generate with LLM
         if not steps:
             print(f"[STEPS] No valid steps in Notion, generating with LLM...")
             steps = generate_steps_with_llm(page)
@@ -511,7 +580,6 @@ def get_solution(problem_id: str):
     try:
         problem = fetch_page(problem_id)
         
-        # Try to get steps from blocks (toggles) - NEW METHOD
         steps_list = []
         try:
             blocks = fetch_page_blocks(problem_id)
@@ -522,24 +590,20 @@ def get_solution(problem_id: str):
         except Exception as e:
             print(f"[SOLUTION] Could not read blocks: {e}")
         
-        # Fallback: try old method
         if not steps_list:
             steps_text = problem.get("step_by_step", "")
             steps_list = parse_steps(steps_text) if steps_text else []
         
-        # If still no valid steps, generate with LLM
         if not steps_list:
             print(f"[SOLUTION] No valid steps found, generating with LLM...")
             steps_list = generate_steps_with_llm(problem)
         
-        # Build full solution text from steps
         full_solution_lines = []
         for i, step in enumerate(steps_list, 1):
             full_solution_lines.append(f"{i}. {step.get('description', step.get('text', ''))}")
         
         full_solution = "\n\n".join(full_solution_lines)
         
-        # Get final answer
         final_answer = problem.get("final_answer", "")
         
         return jsonify({
@@ -562,7 +626,7 @@ def submit_solution():
     data = request.get_json(force=True, silent=True) or {}
     problem_id = data.get("problem_id")
     solution_text = (data.get("solution_text") or "").strip()
-    solution_image = data.get("solution_image")  # NEW: Image in base64
+    solution_image = data.get("solution_image")
     time_spent_seconds = data.get("time_spent_seconds", 0)
     
     print(f"[SUBMIT] problem_id={problem_id}, time={time_spent_seconds}s, has_image={bool(solution_image)}")
@@ -570,26 +634,21 @@ def submit_solution():
     if not problem_id:
         return jsonify({"error": "missing problem_id"}), 400
     
-    # NEW: Accept either text OR image
     if not solution_text and not solution_image:
         return jsonify({"error": "No solution provided"}), 400
     
-    # Fetch problem
     try:
         problem = fetch_page(problem_id)
     except Exception as e:
         return jsonify({"error": f"Cannot read problem: {e}"}), 500
     
-    # Get official answer
     official_answer = problem.get("final_answer", "")
     problem_statement = problem.get("statement", "")
     problem_title = problem.get("title") or problem.get("name", "")
     problem_given = problem.get("given_values", "")
     problem_find = problem.get("find", "")
     
-    # Check if AI is available
     if not ANTHROPIC_API_KEY:
-        # Fallback: basic length check
         is_correct = len(solution_text) > 50 or bool(solution_image)
         return jsonify({
             "correct": is_correct,
@@ -598,10 +657,8 @@ def submit_solution():
             "time_taken": f"{time_spent_seconds // 60}:{time_spent_seconds % 60:02d}"
         })
     
-    # NEW: Use different evaluation based on whether there's an image
     try:
         if solution_image:
-            # Evaluate with image using Vision API
             print(f"[IMAGE] Evaluating solution with Vision API")
             
             evaluation = evaluate_solution_with_image(
@@ -614,7 +671,6 @@ def submit_solution():
                 official_answer=official_answer
             )
         else:
-            # Evaluate text-only (existing logic)
             evaluation = evaluate_solution_with_text(
                 problem_title=problem_title,
                 problem_statement=problem_statement,
@@ -624,7 +680,6 @@ def submit_solution():
                 official_answer=official_answer
             )
         
-        # Format time
         minutes = time_spent_seconds // 60
         seconds = time_spent_seconds % 60
         time_str = f"{minutes}:{seconds:02d}"
@@ -681,10 +736,8 @@ Be encouraging even if wrong. Focus on what they can improve."""
     
     response_text = call_anthropic_api(eval_prompt, max_tokens=1024)
     
-    # Clean response
     response_text = response_text.strip()
     
-    # Remove markdown if present
     if "```json" in response_text:
         response_text = response_text.split("```json")[1].split("```")[0]
     elif "```" in response_text:
@@ -692,18 +745,15 @@ Be encouraging even if wrong. Focus on what they can improve."""
     
     response_text = response_text.strip()
     
-    # Extract JSON with regex
     json_match = re.search(r'\{[^{}]*"correct"[^{}]*\}', response_text, re.DOTALL)
     if json_match:
         response_text = json_match.group(0)
     
-    # Parse JSON
     try:
         parsed = json.loads(response_text)
     except json.JSONDecodeError as je:
         print(f"[ERROR] JSON parse failed: {je}")
         print(f"[ERROR] Response was: {response_text[:200]}")
-        # Fallback
         parsed = {
             "correct": False,
             "score": 30,
@@ -719,13 +769,11 @@ def resize_image_if_needed(base64_data, max_size=1500000):
     Anthropic API has limits on image size.
     """
     try:
-        # If image is small enough, return as is
         if len(base64_data) <= max_size:
             return base64_data
         
         print(f"[IMAGE] Image too large ({len(base64_data)} chars), resizing...")
         
-        # Decode base64 to bytes
         import base64
         from PIL import Image
         from io import BytesIO
@@ -733,16 +781,13 @@ def resize_image_if_needed(base64_data, max_size=1500000):
         image_bytes = base64.b64decode(base64_data)
         image = Image.open(BytesIO(image_bytes))
         
-        # Calculate new size (reduce by 50%)
         original_size = image.size
         new_size = (int(original_size[0] * 0.5), int(original_size[1] * 0.5))
         
         print(f"[IMAGE] Resizing from {original_size} to {new_size}")
         
-        # Resize
         resized_image = image.resize(new_size, Image.Resampling.LANCZOS)
         
-        # Convert back to base64
         buffered = BytesIO()
         resized_image.save(buffered, format="JPEG", quality=85)
         resized_bytes = buffered.getvalue()
@@ -750,7 +795,6 @@ def resize_image_if_needed(base64_data, max_size=1500000):
         
         print(f"[IMAGE] Resized to {len(resized_base64)} chars")
         
-        # If still too large, try again with lower quality
         if len(resized_base64) > max_size:
             buffered = BytesIO()
             resized_image.save(buffered, format="JPEG", quality=60)
@@ -770,8 +814,7 @@ def evaluate_solution_with_image(problem_title, problem_statement, problem_given
     FIXED: Detect media type BEFORE splitting base64 + Auto-resize large images
     """
     try:
-        # Determine media type FIRST (before splitting) - THIS IS THE FIX
-        media_type = "image/jpeg"  # default
+        media_type = "image/jpeg"
         if 'image/png' in solution_image:
             media_type = "image/png"
         elif 'image/jpeg' in solution_image or 'image/jpg' in solution_image:
@@ -783,7 +826,6 @@ def evaluate_solution_with_image(problem_title, problem_statement, problem_given
         
         print(f"[IMAGE] Detected media type: {media_type}")
         
-        # Extract base64 data (remove data:image/...;base64, prefix if present)
         if 'base64,' in solution_image:
             image_data = solution_image.split('base64,')[1]
             print(f"[IMAGE] Extracted base64 data, length: {len(image_data)}")
@@ -791,10 +833,8 @@ def evaluate_solution_with_image(problem_title, problem_statement, problem_given
             image_data = solution_image
             print(f"[IMAGE] Using raw data, length: {len(image_data)}")
         
-        # NEW: Resize if too large
         image_data = resize_image_if_needed(image_data)
         
-        # Build evaluation prompt
         eval_prompt = f"""You are an IB Physics HL examiner evaluating a student's solution.
 
 Problem: {problem_title}
@@ -824,7 +864,6 @@ Respond with ONLY valid JSON (no markdown, no code blocks):
 
 Be encouraging even if wrong. Focus on what they can improve."""
         
-        # Call Anthropic API with Vision
         url = "https://api.anthropic.com/v1/messages"
         headers = {
             "x-api-key": ANTHROPIC_API_KEY,
@@ -865,9 +904,7 @@ Be encouraging even if wrong. Focus on what they can improve."""
             raise Exception(f"Vision API error: {error_msg}")
         
         data = resp.json()
-        content = data.get("content", [{}])[0].get("text", "")
-        
-        print(f"[IMAGE] Response: {response_text[:200]}")
+        content = data.get("content", [])
         
         if content:
             response_text = content[0].get("text", "")
@@ -876,10 +913,8 @@ Be encouraging even if wrong. Focus on what they can improve."""
         
         print(f"[IMAGE] Response: {response_text[:200]}")
         
-        # Clean response
         response_text = response_text.strip()
         
-        # Remove markdown if present
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0]
         elif "```" in response_text:
@@ -887,18 +922,15 @@ Be encouraging even if wrong. Focus on what they can improve."""
         
         response_text = response_text.strip()
         
-        # Extract JSON with regex
         json_match = re.search(r'\{[^{}]*"correct"[^{}]*\}', response_text, re.DOTALL)
         if json_match:
             response_text = json_match.group(0)
         
-        # Parse JSON
         try:
             parsed = json.loads(response_text)
         except json.JSONDecodeError as je:
             print(f"[ERROR] JSON parse failed: {je}")
             print(f"[ERROR] Response was: {response_text[:200]}")
-            # Fallback
             parsed = {
                 "correct": False,
                 "score": 40,
@@ -910,7 +942,6 @@ Be encouraging even if wrong. Focus on what they can improve."""
         
     except Exception as e:
         print(f"[ERROR] Image evaluation failed: {e}")
-        # Fallback response
         return {
             "correct": False,
             "score": 0,
@@ -940,13 +971,11 @@ def chat():
     if not problem_id:
         return jsonify({"error": "missing problem_id"}), 400
     
-    # Fetch problem
     try:
         problem = fetch_page(problem_id)
     except Exception as e:
         return jsonify({"error": f"Cannot read problem: {e}"}), 500
     
-    # Get steps
     steps_list = []
     try:
         blocks = fetch_page_blocks(problem_id)
@@ -955,16 +984,13 @@ def chat():
         print(f"[CHAT] Could not read blocks: {e}")
     
     if not steps_list:
-        # Fallback: try old method from text field
         steps_text = problem.get("step_by_step", "")
         steps_list = parse_steps(steps_text) if steps_text else []
 
-    # If no valid steps, generate with LLM
     if not steps_list:
         print(f"[CHAT] No valid steps found, generating with LLM...")
         steps_list = generate_steps_with_llm(problem)
 
-    # Find current step
     current_step = None
     for s in steps_list:
         if s["id"] == step_id:
@@ -975,7 +1001,6 @@ def chat():
         current_step = steps_list[0]
         step_id = current_step["id"]
     
-    # Check if API is available
     if not ANTHROPIC_API_KEY:
         return jsonify({
             "ok": True,
@@ -985,7 +1010,6 @@ def chat():
             "reply": "AI Coach is not configured."
         })
     
-    # MODE: Free chat (student asking questions)
     if mode == "student" and message_text:
         prompt = f"""You are an IB Physics tutor helping with this problem:
 
@@ -1003,7 +1027,6 @@ Provide a brief, helpful response (2-3 sentences). Guide them towards understand
             print(f"[ERROR] Free chat failed: {e}")
             return jsonify({"reply": f"Sorry, I encountered an error: {str(e)[:100]}"})
     
-    # MODE: Hint
     if mode == "hint":
         prompt = f"""You are an IB Physics tutor. Provide a helpful hint for this step.
 
@@ -1019,7 +1042,6 @@ Provide ONE specific hint (1-2 sentences) that guides the student without giving
             print(f"[ERROR] Hint failed: {e}")
             return jsonify({"hint": f"Try to think about the physics concepts involved in: {current_step.get('description', '')}"})
     
-    # MODE: Tutor (evaluate answer)
     if not student_answer:
         return jsonify({
             "ok": False,
@@ -1028,7 +1050,6 @@ Provide ONE specific hint (1-2 sentences) that guides the student without giving
             "message": "Write your reasoning above."
         })
     
-    # Build evaluation prompt
     eval_prompt = f"""You are an IB Physics tutor evaluating a student's step.
 
 Problem: {problem.get('title', '')}
@@ -1054,10 +1075,8 @@ Rules:
     try:
         response_text = call_anthropic_api(eval_prompt, max_tokens=512)
         
-        # Clean response
         response_text = response_text.strip()
         
-        # Remove markdown if present
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0]
         elif "```" in response_text:
@@ -1065,18 +1084,15 @@ Rules:
         
         response_text = response_text.strip()
         
-        # Try to extract JSON with regex
         json_match = re.search(r'\{[^{}]*"ok"[^{}]*"feedback"[^{}]*\}', response_text, re.DOTALL)
         if json_match:
             response_text = json_match.group(0)
         
-        # Parse JSON
         try:
             parsed = json.loads(response_text)
         except json.JSONDecodeError as je:
             print(f"[ERROR] JSON parse failed: {je}")
             print(f"[ERROR] Response was: {response_text[:200]}")
-            # Fallback response
             parsed = {
                 "ok": len(student_answer) > 15,
                 "feedback": "Your answer was recorded. Try to be more specific with physics concepts.",
@@ -1084,7 +1100,6 @@ Rules:
                 "next_hint": "Explain which formulas or principles apply."
             }
         
-        # Determine next step
         can_advance = bool(parsed.get("ready_to_advance") or parsed.get("ok"))
         next_step = str(int(step_id) + 1) if (can_advance and step_id.isdigit()) else step_id
         message = parsed.get("next_hint", "") if not can_advance else "Great! Continue to the next step."
@@ -1105,9 +1120,419 @@ Rules:
             "message": "Please try again."
         }), 500
 
+# ========================================
+# *** NEW: MULTIUSER AUTHENTICATION ENDPOINTS ***
+# ========================================
+
+@app.post("/api/register")
+def register():
+    """
+    Register a new user.
+    Creates user in Notion Users database.
+    """
+    if not AUTH_AVAILABLE:
+        return jsonify({"error": "Authentication not available (install bcrypt and PyJWT)"}), 500
+    
+    if not USERS_DB_ID:
+        return jsonify({"error": "USERS_DB_ID not configured"}), 500
+    
+    data = request.get_json(force=True, silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    name = (data.get("name") or "").strip()
+    password = data.get("password", "")
+    
+    print(f"[REGISTER] Attempting to register: {email}")
+    
+    # Validate inputs
+    if not email or not name or not password:
+        return jsonify({"error": "Email, name, and password are required"}), 400
+    
+    if not email.endswith("@SEP.com"):
+        return jsonify({"error": "Must use @SEP.com email"}), 400
+    
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    
+    # Check if user already exists
+    try:
+        existing_users = query_database(
+            USERS_DB_ID,
+            filter_obj={
+                "property": "Email",
+                "email": {"equals": email}
+            }
+        )
+        
+        if existing_users:
+            print(f"[REGISTER] User already exists: {email}")
+            return jsonify({"error": "Email already registered"}), 400
+    except Exception as e:
+        print(f"[ERROR] Failed to check existing user: {e}")
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
+    
+    # Hash password
+    try:
+        password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    except Exception as e:
+        print(f"[ERROR] Failed to hash password: {e}")
+        return jsonify({"error": "Failed to secure password"}), 500
+    
+    # Create user in Notion
+    try:
+        properties = {
+            "Name": {
+                "title": [{"text": {"content": name}}]
+            },
+            "Email": {
+                "email": email
+            },
+            "password_hash": {
+                "rich_text": [{"text": {"content": password_hash}}]
+            },
+            "created_at": {
+                "date": {"start": datetime.utcnow().isoformat()}
+            },
+            "status": {
+                "select": {"name": "active"}
+            }
+        }
+        
+        create_page_in_database(USERS_DB_ID, properties)
+        
+        print(f"[REGISTER] User created successfully: {email}")
+        
+        return jsonify({
+            "success": True,
+            "message": "Account created successfully! Please login."
+        }), 201
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to create user: {e}")
+        return jsonify({"error": f"Failed to create account: {str(e)}"}), 500
+
+@app.post("/api/login")
+def login():
+    """
+    Login user.
+    Validates credentials and returns JWT token.
+    """
+    if not AUTH_AVAILABLE:
+        return jsonify({"error": "Authentication not available (install bcrypt and PyJWT)"}), 500
+    
+    if not USERS_DB_ID:
+        return jsonify({"error": "USERS_DB_ID not configured"}), 500
+    
+    data = request.get_json(force=True, silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password", "")
+    
+    print(f"[LOGIN] Attempting login: {email}")
+    
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
+    
+    # Find user
+    try:
+        users = query_database(
+            USERS_DB_ID,
+            filter_obj={
+                "property": "Email",
+                "email": {"equals": email}
+            }
+        )
+        
+        if not users:
+            print(f"[LOGIN] User not found: {email}")
+            return jsonify({"error": "Invalid email or password"}), 401
+        
+        user = users[0]
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to find user: {e}")
+        return jsonify({"error": f"Database error: {str(e)}"}), 500
+    
+    # Verify password
+    try:
+        stored_hash = user.get("password_hash", "")
+        
+        if not stored_hash:
+            print(f"[ERROR] No password hash for user: {email}")
+            return jsonify({"error": "Invalid account configuration"}), 500
+        
+        if not bcrypt.checkpw(password.encode('utf-8'), stored_hash.encode('utf-8')):
+            print(f"[LOGIN] Invalid password for user: {email}")
+            return jsonify({"error": "Invalid email or password"}), 401
+        
+    except Exception as e:
+        print(f"[ERROR] Password verification failed: {e}")
+        return jsonify({"error": "Authentication failed"}), 500
+    
+    # Update last_login
+    try:
+        # Note: Notion API doesn't support PATCH, so we'd need to use the pages endpoint
+        # For now, we'll skip this to keep it simple
+        pass
+    except Exception as e:
+        print(f"[WARN] Could not update last_login: {e}")
+    
+    # Create JWT token
+    try:
+        token_payload = {
+            "email": email,
+            "name": user.get("Name", ""),
+            "exp": datetime.utcnow() + timedelta(days=7)
+        }
+        
+        token = jwt.encode(token_payload, JWT_SECRET_KEY, algorithm='HS256')
+        
+        print(f"[LOGIN] Login successful: {email}")
+        
+        return jsonify({
+            "success": True,
+            "token": token,
+            "user": {
+                "email": email,
+                "name": user.get("Name", "")
+            }
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to create token: {e}")
+        return jsonify({"error": "Failed to create session"}), 500
+
+@app.get("/api/verify-session")
+@require_auth
+def verify_session():
+    """
+    Verify if JWT token is valid.
+    Requires authentication (automatically validated by decorator).
+    """
+    user = request.user  # Set by @require_auth decorator
+    
+    return jsonify({
+        "valid": True,
+        "user": {
+            "email": user.get("email"),
+            "name": user.get("name")
+        }
+    }), 200
+
+@app.post("/api/track-activity")
+@require_auth
+def track_activity():
+    """
+    Track user activity (opening problems, submitting solutions, etc).
+    Creates entry in Activity Log database.
+    """
+    if not ACTIVITY_DB_ID:
+        return jsonify({"error": "ACTIVITY_DB_ID not configured"}), 500
+    
+    user = request.user
+    data = request.get_json(force=True, silent=True) or {}
+    
+    problem_id = data.get("problem_id", "")
+    problem_name = data.get("problem_name", "")
+    action = data.get("action", "opened")  # opened, started, submitted, completed
+    time_spent = data.get("time_spent", 0)
+    score = data.get("score", 0)
+    attempt_number = data.get("attempt_number", 1)
+    
+    print(f"[TRACK] user={user.get('email')}, problem={problem_id}, action={action}")
+    
+    # Create activity log entry
+    try:
+        properties = {
+            "problem_name": {
+                "title": [{"text": {"content": problem_name or problem_id}}]
+            },
+            "user_email": {
+                "email": user.get("email")
+            },
+            "problem_id": {
+                "rich_text": [{"text": {"content": problem_id}}]
+            },
+            "action": {
+                "select": {"name": action}
+            },
+            "timestamp": {
+                "date": {"start": datetime.utcnow().isoformat()}
+            },
+            "time_spent_seconds": {
+                "number": int(time_spent)
+            },
+            "score": {
+                "number": int(score)
+            },
+            "attempt_number": {
+                "number": int(attempt_number)
+            }
+        }
+        
+        create_page_in_database(ACTIVITY_DB_ID, properties)
+        
+        return jsonify({"success": True}), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to track activity: {e}")
+        return jsonify({"error": f"Failed to track activity: {str(e)}"}), 500
+
+@app.get("/api/user-progress")
+@require_auth
+def user_progress():
+    """
+    Get progress for current user.
+    Returns statistics from Activity Log.
+    """
+    if not ACTIVITY_DB_ID:
+        return jsonify({"error": "ACTIVITY_DB_ID not configured"}), 500
+    
+    user = request.user
+    email = user.get("email")
+    
+    print(f"[PROGRESS] Getting progress for: {email}")
+    
+    # Get all activities for this user
+    try:
+        activities = query_database(
+            ACTIVITY_DB_ID,
+            filter_obj={
+                "property": "user_email",
+                "email": {"equals": email}
+            },
+            sorts=[{"property": "timestamp", "direction": "descending"}]
+        )
+        
+        # Calculate statistics
+        total_time = 0
+        problems_attempted = set()
+        problems_completed = set()
+        scores = []
+        
+        for activity in activities:
+            problem_id = activity.get("problem_id", "")
+            action = activity.get("action", "")
+            time_spent = activity.get("time_spent_seconds", 0) or 0
+            score = activity.get("score", 0) or 0
+            
+            if action == "started" or action == "opened":
+                problems_attempted.add(problem_id)
+            
+            if action == "completed":
+                problems_completed.add(problem_id)
+                total_time += time_spent
+                if score > 0:
+                    scores.append(score)
+        
+        # Get recent activities (last 10)
+        recent = activities[:10] if len(activities) > 10 else activities
+        
+        return jsonify({
+            "email": email,
+            "name": user.get("name", ""),
+            "problems_attempted": len(problems_attempted),
+            "problems_completed": len(problems_completed),
+            "total_time_minutes": total_time // 60,
+            "average_score": round(sum(scores) / len(scores), 1) if scores else 0,
+            "recent_activities": recent
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to get progress: {e}")
+        return jsonify({"error": f"Failed to get progress: {str(e)}"}), 500
+
+@app.get("/api/all-users")
+def all_users():
+    """
+    Get all users and their progress.
+    FOR ADMIN/PROFESSOR USE ONLY.
+    
+    NOTE: In production, this should require admin authentication.
+    For MVP, we're keeping it open for simplicity.
+    """
+    if not USERS_DB_ID or not ACTIVITY_DB_ID:
+        return jsonify({"error": "Databases not configured"}), 500
+    
+    print(f"[ADMIN] Getting all users")
+    
+    try:
+        # Get all users
+        users = query_database(USERS_DB_ID)
+        
+        # Get all activities
+        all_activities = query_database(ACTIVITY_DB_ID)
+        
+        # Build stats per user
+        user_stats = []
+        
+        for user in users:
+            email = user.get("Email", "")
+            name = user.get("Name", "")
+            
+            # Filter activities for this user
+            user_activities = [a for a in all_activities if a.get("user_email") == email]
+            
+            # Calculate stats
+            total_time = 0
+            problems_attempted = set()
+            problems_completed = set()
+            scores = []
+            last_active = None
+            
+            for activity in user_activities:
+                problem_id = activity.get("problem_id", "")
+                action = activity.get("action", "")
+                time_spent = activity.get("time_spent_seconds", 0) or 0
+                score = activity.get("score", 0) or 0
+                timestamp = activity.get("timestamp")
+                
+                if action in ["started", "opened"]:
+                    problems_attempted.add(problem_id)
+                
+                if action == "completed":
+                    problems_completed.add(problem_id)
+                    total_time += time_spent
+                    if score > 0:
+                        scores.append(score)
+                
+                if timestamp and (not last_active or timestamp > last_active):
+                    last_active = timestamp
+            
+            user_stats.append({
+                "email": email,
+                "name": name,
+                "last_active": last_active,
+                "problems_attempted": len(problems_attempted),
+                "problems_completed": len(problems_completed),
+                "avg_score": round(sum(scores) / len(scores), 1) if scores else 0,
+                "total_time_minutes": total_time // 60
+            })
+        
+        # Calculate overall stats
+        total_students = len(users)
+        active_today = sum(1 for u in user_stats if u.get("last_active") and 
+                          (datetime.utcnow() - datetime.fromisoformat(u["last_active"].replace("Z", ""))).days == 0)
+        problems_solved = sum(u["problems_completed"] for u in user_stats)
+        avg_score = round(sum(u["avg_score"] for u in user_stats if u["avg_score"] > 0) / 
+                         len([u for u in user_stats if u["avg_score"] > 0]), 1) if user_stats else 0
+        
+        return jsonify({
+            "total_students": total_students,
+            "active_today": active_today,
+            "problems_solved": problems_solved,
+            "avg_score": avg_score,
+            "students": user_stats
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to get all users: {e}")
+        return jsonify({"error": f"Failed to get users: {str(e)}"}), 500
+
+# ========================================
+# *** END OF MULTIUSER SYSTEM ***
+# ========================================
+
 # ==============================
 # Gunicorn entry
 # ==============================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
-

@@ -135,9 +135,13 @@ def fetch_page(page_id: str) -> Dict[str, Any]:
 
 def query_database(database_id: str, filter_obj: dict = None, sorts: list = None) -> List[Dict[str, Any]]:
     """Query a Notion database with full pagination (brings ALL results)."""
-    db_id = sanitize_uuid(database_id)
-    if not db_id:
-        raise ValueError("Invalid database ID")
+    # Don't sanitize USERS_DB_ID and ACTIVITY_DB_ID - they're already in correct format
+    if database_id in [USERS_DB_ID, ACTIVITY_DB_ID]:
+        db_id = database_id
+    else:
+        db_id = sanitize_uuid(database_id)
+        if not db_id:
+            raise ValueError("Invalid database ID")
     
     url = f"{NOTION_BASE}/databases/{db_id}/query"
     
@@ -203,9 +207,13 @@ def query_database(database_id: str, filter_obj: dict = None, sorts: list = None
 # ========================================
 def create_page_in_database(database_id: str, properties: dict) -> dict:
     """Create a new page in a Notion database."""
-    db_id = sanitize_uuid(database_id)
-    if not db_id:
-        raise ValueError("Invalid database ID")
+    # Don't sanitize USERS_DB_ID and ACTIVITY_DB_ID - they're already in correct format
+    if database_id in [USERS_DB_ID, ACTIVITY_DB_ID]:
+        db_id = database_id
+    else:
+        db_id = sanitize_uuid(database_id)
+        if not db_id:
+            raise ValueError("Invalid database ID")
     
     url = f"{NOTION_BASE}/pages"
     

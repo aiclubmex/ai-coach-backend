@@ -1147,7 +1147,7 @@ def register():
     if not email or not name or not password:
         return jsonify({"error": "Email, name, and password are required"}), 400
     
-    if not email.endswith("@SEP.com"):
+    if not email.endswith("@asf.edu.mx"):
         return jsonify({"error": "Must use @SEP.com email"}), 400
     
     if len(password) < 6:

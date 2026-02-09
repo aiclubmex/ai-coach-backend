@@ -1517,8 +1517,27 @@ def all_users():
         
         # Calculate overall stats
         total_students = len(users)
-        active_today = sum(1 for u in user_stats if u.get("last_active") and 
-                          (datetime.utcnow() - datetime.fromisoformat(u["last_active"].replace("Z", ""))).days == 0)
+        
+        # Calculate active_today safely
+        active_today = 0
+        for u in user_stats:
+            if u.get("last_active"):
+                try:
+                    # Parse the datetime string (handles both with and without timezone)
+                    last_active_str = u["last_active"].replace("Z", "+00:00")
+                    last_active_dt = datetime.fromisoformat(last_active_str)
+                    
+                    # Make utcnow timezone-aware
+                    from datetime import timezone
+                    now_utc = datetime.now(timezone.utc)
+                    
+                    # Calculate difference
+                    diff = now_utc - last_active_dt
+                    if diff.days == 0:
+                        active_today += 1
+                except Exception as e:
+                    print(f"[WARN] Could not parse last_active for {u.get('email')}: {e}")
+                    continue
         problems_solved = sum(u["problems_completed"] for u in user_stats)
         avg_score = round(sum(u["avg_score"] for u in user_stats if u["avg_score"] > 0) / 
                          len([u for u in user_stats if u["avg_score"] > 0]), 1) if user_stats else 0

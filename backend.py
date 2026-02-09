@@ -1539,8 +1539,13 @@ def all_users():
                     print(f"[WARN] Could not parse last_active for {u.get('email')}: {e}")
                     continue
         problems_solved = sum(u["problems_completed"] for u in user_stats)
-        avg_score = round(sum(u["avg_score"] for u in user_stats if u["avg_score"] > 0) / 
-                         len([u for u in user_stats if u["avg_score"] > 0]), 1) if user_stats else 0
+        
+        # Calculate avg_score safely (avoid division by zero)
+        users_with_scores = [u for u in user_stats if u["avg_score"] > 0]
+        if users_with_scores:
+            avg_score = round(sum(u["avg_score"] for u in users_with_scores) / len(users_with_scores), 1)
+        else:
+            avg_score = 0
         
         return jsonify({
             "total_students": total_students,

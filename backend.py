@@ -348,8 +348,88 @@ def get_steps(problem_id: str):
 
 @app.post("/submit-solution")
 def submit_solution():
-    # (Omitido por brevedad - mantiene lógica original)
-    return jsonify({"success": True, "feedback": "Solution received."})
+    """
+    Evaluate student's solution using Claude API.
+    Returns score and feedback.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    problem_id = data.get("problem_id")
+    solution_text = data.get("solution_text", "")
+    time_spent = data.get("time_spent_seconds", 0)
+    
+    if not problem_id or not solution_text:
+        return jsonify({"error": "Missing problem_id or solution_text"}), 400
+    
+    print(f"[SUBMIT] Evaluating solution for problem: {problem_id}")
+    
+    try:
+        # Get problem details
+        problem = fetch_page(problem_id)
+        
+        # Build evaluation prompt
+        prompt = f"""You are an IB Physics HL examiner. Evaluate this student's solution.
+
+Problem: {problem.get('name', '')}
+Statement: {problem.get('problem_statement', '')}
+Given: {problem.get('given_values', '')}
+Find: {problem.get('find', '')}
+
+Student's Solution:
+{solution_text}
+
+Evaluate the solution and respond with a JSON object:
+{{
+  "score": <number 0-100>,
+  "correct": <true if score >= 70, false otherwise>,
+  "feedback": "<detailed feedback explaining what's correct/incorrect>",
+  "time_taken": "{time_spent // 60}:{time_spent % 60:02d}"
+}}
+
+Be specific about what's correct and what needs improvement.
+"""
+        
+        # Call Claude API
+        if not ANTHROPIC_API_KEY:
+            return jsonify({
+                "score": 50,
+                "correct": False,
+                "feedback": "Solution submitted but cannot evaluate (API key missing)",
+                "time_taken": f"{time_spent // 60}:{time_spent % 60:02d}"
+            })
+        
+        response_text = call_anthropic_api(prompt, max_tokens=1024)
+        
+        # Parse response
+        import json
+        # Remove markdown code blocks if present
+        clean_response = response_text.strip()
+        if clean_response.startswith('```'):
+            clean_response = '\n'.join(clean_response.split('\n')[1:-1])
+        
+        result = json.loads(clean_response)
+        
+        # Ensure required fields
+        result.setdefault('score', 50)
+        result.setdefault('correct', result.get('score', 0) >= 70)
+        result.setdefault('feedback', 'Solution evaluated.')
+        result.setdefault('time_taken', f"{time_spent // 60}:{time_spent % 60:02d}")
+        
+        print(f"[SUBMIT] Score: {result['score']}, Correct: {result['correct']}")
+        
+        return jsonify(result), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Submit solution failed: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Fallback response
+        return jsonify({
+            "score": 50,
+            "correct": False,
+            "feedback": f"Error evaluating solution: {str(e)}",
+            "time_taken": f"{time_spent // 60}:{time_spent % 60:02d}"
+        }), 200)
 
 @app.post("/chat")
 def chat():

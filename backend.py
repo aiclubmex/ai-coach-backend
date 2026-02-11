@@ -429,7 +429,7 @@ Be specific about what's correct and what needs improvement.
             "correct": False,
             "feedback": f"Error evaluating solution: {str(e)}",
             "time_taken": f"{time_spent // 60}:{time_spent % 60:02d}"
-        }), 200)
+        }), 200
 
 @app.post("/chat")
 def chat():

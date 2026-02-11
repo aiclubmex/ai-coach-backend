@@ -417,8 +417,116 @@ def user_progress():
 
 @app.get("/api/all-users")
 def all_users():
-    # (Omitido por brevedad - mantiene lógica original)
-    return jsonify({"students": []})
+    """
+    Get all users and their progress.
+    FOR ADMIN/PROFESSOR USE ONLY.
+    """
+    if not USERS_DB_ID or not ACTIVITY_DB_ID:
+        return jsonify({"error": "Databases not configured"}), 500
+    
+    print(f"[ADMIN] Getting all users")
+    
+    try:
+        # Get all users
+        users = query_database(USERS_DB_ID)
+        print(f"[ADMIN] Found {len(users)} users")
+        
+        # Get all activities
+        all_activities = query_database(ACTIVITY_DB_ID)
+        print(f"[ADMIN] Found {len(all_activities)} activities")
+        
+        # Build stats per user
+        user_stats = []
+        
+        for user in users:
+            email = user.get("Email", "")
+            name = user.get("Name", "")
+            
+            if not email:
+                continue
+            
+            # Filter activities for this user
+            user_activities = [a for a in all_activities if a.get("user_email") == email]
+            
+            # Calculate stats
+            total_time = 0
+            problems_attempted = set()
+            problems_completed = set()
+            scores = []
+            last_active = None
+            
+            for activity in user_activities:
+                problem_id = activity.get("problem_id", "")
+                action = activity.get("action", "")
+                time_spent = activity.get("time_spent_seconds", 0) or 0
+                score = activity.get("score", 0) or 0
+                timestamp = activity.get("timestamp")
+                
+                if action in ["started", "opened"]:
+                    problems_attempted.add(problem_id)
+                
+                if action == "completed":
+                    problems_completed.add(problem_id)
+                    total_time += time_spent
+                    if score > 0:
+                        scores.append(score)
+                
+                if timestamp and (not last_active or timestamp > last_active):
+                    last_active = timestamp
+            
+            user_stats.append({
+                "email": email,
+                "name": name,
+                "last_active": last_active,
+                "problems_attempted": len(problems_attempted),
+                "problems_completed": len(problems_completed),
+                "avg_score": round(sum(scores) / len(scores), 1) if scores else 0,
+                "total_time_minutes": total_time // 60
+            })
+        
+        # Calculate overall stats
+        total_students = len(user_stats)
+        
+        # Calculate active_today safely
+        active_today = 0
+        for u in user_stats:
+            if u.get("last_active"):
+                try:
+                    from datetime import timezone
+                    last_active_str = u["last_active"].replace("Z", "+00:00")
+                    last_active_dt = datetime.fromisoformat(last_active_str)
+                    now_utc = datetime.now(timezone.utc)
+                    diff = now_utc - last_active_dt
+                    if diff.days == 0:
+                        active_today += 1
+                except Exception as e:
+                    print(f"[WARN] Could not parse last_active: {e}")
+                    continue
+        
+        problems_solved = sum(u["problems_completed"] for u in user_stats)
+        
+        # Calculate avg_score safely
+        users_with_scores = [u for u in user_stats if u["avg_score"] > 0]
+        if users_with_scores:
+            avg_score = round(sum(u["avg_score"] for u in users_with_scores) / len(users_with_scores), 1)
+        else:
+            avg_score = 0
+        
+        print(f"[ADMIN] Returning {total_students} students")
+        
+        return jsonify({
+            "total_students": total_students,
+            "active_today": active_today,
+            "problems_solved": problems_solved,
+            "avg_score": avg_score,
+            "students": user_stats
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to get all users: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Failed to get users: {str(e)}"}), 500
 
 # ============================================================================
 # SISTEMA DE TAREAS/HOMEWORK - ENDPOINTS CON PROBLEM_REFERENCES

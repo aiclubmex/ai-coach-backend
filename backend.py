@@ -1,3 +1,5 @@
+--- START OF FILE Paste February 11, 2026 - 7:30AM ---
+
 # backend.py
 # Flask API for Physics AI Coach
 # - GET /                -> health
@@ -16,7 +18,7 @@
 # - GET  /api/all-users          -> get all users (admin only)
 # ========================================
 
-import os, re, json
+import os, re, json, uuid
 from typing import List, Dict, Any
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -49,6 +51,7 @@ FRONTEND_ORIGIN     = os.environ.get("FRONTEND_ORIGIN", "https://aiclub.com.mx")
 # ========================================
 USERS_DB_ID         = os.environ.get("USERS_DB_ID", "")
 ACTIVITY_DB_ID      = os.environ.get("ACTIVITY_DB_ID", "")
+HOMEWORK_DB_ID      = os.environ.get("HOMEWORK_DB_ID", "") # *** NEW: Homework DB ID ***
 JWT_SECRET_KEY      = os.environ.get("JWT_SECRET_KEY", "change-this-secret-key-in-production")
 
 # ==============================
@@ -126,6 +129,8 @@ def fetch_page(page_id: str) -> Dict[str, Any]:
                 out[k] = date_obj.get("start", "")
             else:
                 out[k] = None
+        elif ptype == "checkbox": # *** NEW: Support for checkbox ***
+            out[k] = v.get("checkbox", False)
     
     return out
 
@@ -135,8 +140,8 @@ def fetch_page(page_id: str) -> Dict[str, Any]:
 
 def query_database(database_id: str, filter_obj: dict = None, sorts: list = None) -> List[Dict[str, Any]]:
     """Query a Notion database with full pagination (brings ALL results)."""
-    # Don't sanitize USERS_DB_ID and ACTIVITY_DB_ID - they're already in correct format
-    if database_id in [USERS_DB_ID, ACTIVITY_DB_ID]:
+    # Don't sanitize special DB IDs - they're already in correct format
+    if database_id in [USERS_DB_ID, ACTIVITY_DB_ID, HOMEWORK_DB_ID]:
         db_id = database_id
     else:
         db_id = sanitize_uuid(database_id)
@@ -194,6 +199,8 @@ def query_database(database_id: str, filter_obj: dict = None, sorts: list = None
                     obj[k] = date_obj.get("start", "")
                 else:
                     obj[k] = None
+            elif ptype == "checkbox": # *** NEW ***
+                obj[k] = v.get("checkbox", False)
         results.append(obj)
     
     return results
@@ -207,8 +214,8 @@ def query_database(database_id: str, filter_obj: dict = None, sorts: list = None
 # ========================================
 def create_page_in_database(database_id: str, properties: dict) -> dict:
     """Create a new page in a Notion database."""
-    # Don't sanitize USERS_DB_ID and ACTIVITY_DB_ID - they're already in correct format
-    if database_id in [USERS_DB_ID, ACTIVITY_DB_ID]:
+    # Don't sanitize special IDs - they're already in correct format
+    if database_id in [USERS_DB_ID, ACTIVITY_DB_ID, HOMEWORK_DB_ID]:
         db_id = database_id
     else:
         db_id = sanitize_uuid(database_id)
@@ -223,6 +230,22 @@ def create_page_in_database(database_id: str, properties: dict) -> dict:
     }
     
     resp = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+# ========================================
+# *** NEW: Helper function to update Notion pages ***
+# ========================================
+def update_page_properties(page_id: str, properties: dict) -> dict:
+    """Update properties of an existing Notion page."""
+    pid = sanitize_uuid(page_id)
+    if not pid:
+        raise ValueError("Invalid page ID")
+        
+    url = f"{NOTION_BASE}/pages/{pid}"
+    payload = {"properties": properties}
+    
+    resp = requests.patch(url, headers=NOTION_HEADERS, json=payload, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
@@ -1558,6 +1581,128 @@ def all_users():
     except Exception as e:
         print(f"[ERROR] Failed to get all users: {e}")
         return jsonify({"error": f"Failed to get users: {str(e)}"}), 500
+
+# ============================================================================
+# SISTEMA DE TAREAS/HOMEWORK - ENDPOINTS AGREGADOS
+# ============================================================================
+
+@app.post("/api/assign-homework")
+def assign_homework():
+    """
+    Asigna una tarea a un estudiante específico o a todos los estudiantes
+    """
+    if not HOMEWORK_DB_ID:
+        return jsonify({"error": "HOMEWORK_DB_ID not configured"}), 500
+        
+    data = request.get_json(force=True, silent=True) or request.form.to_dict()
+    student_id = data.get("student_id")  # En este sistema el ID es el Email del estudiante
+    title = data.get("title")
+    description = data.get("description", "")
+    due_date = data.get("due_date")
+    points = int(data.get("points", 0))
+    topic = data.get("topic", "")
+
+    if not title or not student_id or not due_date:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    try:
+        def build_props(email):
+            return {
+                "title": {"title": [{"text": {"content": title}}]},
+                "student_email": {"email": email},
+                "description": {"rich_text": [{"text": {"content": description}}]},
+                "due_date": {"date": {"start": due_date}},
+                "points": {"number": points},
+                "topic": {"rich_text": [{"text": {"content": topic}}]},
+                "completed": {"checkbox": False},
+                "created_at": {"date": {"start": datetime.utcnow().isoformat()}}
+            }
+
+        if student_id == "all":
+            students = query_database(USERS_DB_ID)
+            count = 0
+            for student in students:
+                email = student.get("Email")
+                if email:
+                    create_page_in_database(HOMEWORK_DB_ID, build_props(email))
+                    count += 1
+            return jsonify({"success": True, "message": f"Homework assigned to {count} students", "count": count})
+        else:
+            create_page_in_database(HOMEWORK_DB_ID, build_props(student_id))
+            return jsonify({"success": True, "message": "Homework assigned successfully"})
+
+    except Exception as e:
+        print(f"[ERROR] Failed to assign homework: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.get("/api/student-homework")
+@require_auth
+def get_student_homework():
+    """
+    Obtiene todas las tareas de un estudiante (requiere auth)
+    """
+    if not HOMEWORK_DB_ID:
+        return jsonify({"error": "HOMEWORK_DB_ID not configured"}), 500
+        
+    student_email = request.user.get("email")
+    
+    try:
+        homework_list = query_database(
+            HOMEWORK_DB_ID,
+            filter_obj={
+                "property": "student_email",
+                "email": {"equals": student_email}
+            },
+            sorts=[{"property": "due_date", "direction": "ascending"}]
+        )
+        return jsonify({"homework": homework_list})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/complete-homework/<homework_id>")
+@require_auth
+def complete_homework(homework_id):
+    """
+    Marca una tarea como completada
+    """
+    student_email = request.user.get("email")
+    
+    try:
+        # Verificar pertenencia
+        hw = fetch_page(homework_id)
+        if hw.get("student_email") != student_email:
+            return jsonify({"error": "Unauthorized"}), 403
+            
+        # Actualizar
+        update_page_properties(homework_id, {
+            "completed": {"checkbox": True},
+            "completed_at": {"date": {"start": datetime.utcnow().isoformat()}}
+        })
+        
+        points_earned = hw.get("points", 0)
+        return jsonify({
+            "success": True, 
+            "points_earned": points_earned, 
+            "message": f"Great job! You earned {points_earned} points"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.get("/api/students-list")
+def get_students_list():
+    """
+    Retorna lista simple de estudiantes para el dropdown
+    """
+    try:
+        users = query_database(USERS_DB_ID)
+        # Filtramos solo por los que tienen nombre y email
+        students = [
+            {"id": u.get("Email"), "name": u.get("Name"), "email": u.get("Email")}
+            for u in users if u.get("Email")
+        ]
+        return jsonify({"students": students})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ========================================
 # *** END OF MULTIUSER SYSTEM ***

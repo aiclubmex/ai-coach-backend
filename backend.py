@@ -489,73 +489,10 @@ def track_activity():
         return jsonify({"success": True})
     except Exception as e: return jsonify({"error": str(e)}), 500
 
-@app.get("/api/user-progress")
-@require_auth
-def user_progress():
-    """
-    Get progress for current user.
-    Returns statistics from Activity Log.
-    """
-    if not ACTIVITY_DB_ID:
-        return jsonify({"error": "ACTIVITY_DB_ID not configured"}), 500
-    
-    user = request.user
-    email = user.get("email")
-    
-    print(f"[PROGRESS] Getting progress for: {email}")
-    
-    # Get all activities for this user
-    try:
-        activities = query_database(
-            ACTIVITY_DB_ID,
-            filter_obj={
-                "property": "user_email",
-                "email": {"equals": email}
-            },
-            sorts=[{"property": "timestamp", "direction": "descending"}]
-        )
-        
-        # Calculate statistics
-        total_time = 0
-        problems_attempted = set()
-        problems_completed = set()
-        scores = []
-        
-        for activity in activities:
-            problem_id = activity.get("problem_id", "")
-            action = activity.get("action", "")
-            time_spent = activity.get("time_spent_seconds", 0) or 0
-            score = activity.get("score", 0) or 0
-            
-            if action == "started" or action == "opened":
-                problems_attempted.add(problem_id)
-            
-            if action == "completed":
-                problems_completed.add(problem_id)
-                total_time += time_spent
-                if score > 0:
-                    scores.append(score)
-        
-        # Get recent activities (last 10)
-        recent = activities[:10] if len(activities) > 10 else activities
-        
-        return jsonify({
-            "email": email,
-            "name": user.get("name", "Student"),
-            "problems_attempted": len(problems_attempted),
-            "problems_completed": len(problems_completed),
-            "total_time_minutes": total_time // 60,
-            "average_score": round(sum(scores) / len(scores), 1) if scores else 0,
-            "recent_activities": recent
-        }), 200
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to get progress: {e}")
-        return jsonify({"error": f"Failed to get progress: {str(e)}"}), 500
 @app.get("/api/all-users")
 def all_users():
     """
-    Get all users and their progress.
+    Get all users and their progress with recent activities.
     FOR ADMIN/PROFESSOR USE ONLY.
     """
     if not USERS_DB_ID or not ACTIVITY_DB_ID:
@@ -585,6 +522,9 @@ def all_users():
             # Filter activities for this user
             user_activities = [a for a in all_activities if a.get("user_email") == email]
             
+            # Sort by timestamp descending
+            user_activities.sort(key=lambda x: x.get("timestamp", "") or "", reverse=True)
+            
             # Calculate stats
             total_time = 0
             problems_attempted = set()
@@ -593,23 +533,34 @@ def all_users():
             last_active = None
             
             for activity in user_activities:
-                problem_id = activity.get("problem_id", "")
+                problem_name = activity.get("problem_name", "")
                 action = activity.get("action", "")
                 time_spent = activity.get("time_spent_seconds", 0) or 0
                 score = activity.get("score", 0) or 0
                 timestamp = activity.get("timestamp")
                 
                 if action in ["started", "opened"]:
-                    problems_attempted.add(problem_id)
+                    problems_attempted.add(problem_name)
                 
                 if action == "completed":
-                    problems_completed.add(problem_id)
+                    problems_completed.add(problem_name)
                     total_time += time_spent
                     if score > 0:
                         scores.append(score)
                 
                 if timestamp and (not last_active or timestamp > last_active):
                     last_active = timestamp
+            
+            # Get recent activities (last 10) for detail view
+            recent_activities = []
+            for activity in user_activities[:10]:
+                recent_activities.append({
+                    "problem_name": activity.get("problem_name", "Unknown"),
+                    "action": activity.get("action", "opened"),
+                    "score": activity.get("score", 0) or 0,
+                    "time_spent_seconds": activity.get("time_spent_seconds", 0) or 0,
+                    "timestamp": activity.get("timestamp", "")
+                })
             
             user_stats.append({
                 "email": email,
@@ -618,7 +569,8 @@ def all_users():
                 "problems_attempted": len(problems_attempted),
                 "problems_completed": len(problems_completed),
                 "avg_score": round(sum(scores) / len(scores), 1) if scores else 0,
-                "total_time_minutes": total_time // 60
+                "total_time_minutes": total_time // 60,
+                "recent_activities": recent_activities
             })
         
         # Calculate overall stats
@@ -649,7 +601,7 @@ def all_users():
         else:
             avg_score = 0
         
-        print(f"[ADMIN] Returning {total_students} students")
+        print(f"[ADMIN] Returning {total_students} students with activities")
         
         return jsonify({
             "total_students": total_students,
@@ -664,6 +616,7 @@ def all_users():
         import traceback
         traceback.print_exc()
         return jsonify({"error": f"Failed to get users: {str(e)}"}), 500
+
 
 # ============================================================================
 # SISTEMA DE TAREAS/HOMEWORK - ENDPOINTS CON PROBLEM_REFERENCES

@@ -479,15 +479,31 @@ def verify_session():
 @require_auth
 def track_activity():
     data = request.get_json(force=True, silent=True) or {}
+    
+    # Build properties for Notion
+    properties = {
+        "problem_name": {"title": [{"text": {"content": data.get("problem_name", "")}}]},
+        "user_email": {"email": request.user["email"]},
+        "action": {"select": {"name": data.get("action", "opened")}},
+        "timestamp": {"date": {"start": datetime.utcnow().isoformat()}}
+    }
+    
+    # Add optional fields if present
+    if data.get("problem_reference"):
+        properties["problem_reference"] = {"rich_text": [{"text": {"content": data.get("problem_reference", "")}}]}
+    
+    if data.get("score") is not None:
+        properties["score"] = {"number": data.get("score", 0)}
+    
+    if data.get("time_spent_seconds") is not None:
+        properties["time_spent_seconds"] = {"number": data.get("time_spent_seconds", 0)}
+    
     try:
-        create_page_in_database(ACTIVITY_DB_ID, {
-            "problem_name": {"title": [{"text": {"content": data.get("problem_name", "")}}]},
-            "user_email": {"email": request.user["email"]},
-            "action": {"select": {"name": data.get("action", "opened")}},
-            "timestamp": {"date": {"start": datetime.utcnow().isoformat()}}
-        })
+        create_page_in_database(ACTIVITY_DB_ID, properties)
         return jsonify({"success": True})
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e: 
+        print(f"[ERROR] Track activity failed: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.get("/api/all-users")
 def all_users():

@@ -570,8 +570,10 @@ def all_users():
             # Get recent activities (last 10) for detail view
             recent_activities = []
             for activity in user_activities[:10]:
+                # Prefer problem_reference over problem_name for display
+                display_name = activity.get("problem_reference") or activity.get("problem_name", "Unknown")
                 recent_activities.append({
-                    "problem_name": activity.get("problem_name", "Unknown"),
+                    "problem_name": display_name,
                     "action": activity.get("action", "opened"),
                     "score": activity.get("score", 0) or 0,
                     "time_spent_seconds": activity.get("time_spent_seconds", 0) or 0,

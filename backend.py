@@ -876,7 +876,7 @@ def get_student_homework():
         for hw in hw_list:
             hw_data = {
                 "id": hw.get("id"),
-                "title": hw.get("title"),
+                "title": hw.get("Title") or hw.get("title") or hw.get("name") or "Assignment",
                 "description": hw.get("description", ""),
                 "due_date": hw.get("due_date"),
                 "points": hw.get("points", 0),

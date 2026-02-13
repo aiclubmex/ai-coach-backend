@@ -776,8 +776,11 @@ def all_users():
 @app.post("/api/assign-homework")
 def assign_homework():
     """
-    Asigna una tarea a un estudiante específico o a todos los estudiantes.
-    Soporta problem_references (IDs de problemas separados por coma).
+    Asigna una tarea a un estudiante específico, a un grupo, o a todos los estudiantes.
+    Soporta:
+    - student_id = "all" -> todos los estudiantes
+    - student_id = "group:IB HL" -> todos los estudiantes del grupo "IB HL"
+    - student_id = "email@example.com" -> estudiante individual
     """
     if not HOMEWORK_DB_ID: return jsonify({"error": "HOMEWORK_DB_ID missing"}), 500
     
@@ -789,10 +792,10 @@ def assign_homework():
     points = int(data.get("points", 0))
     topic = data.get("topic", "")
     problem_references = data.get("problem_references", "")
-
+    
     if not title or not student_id or not due_date:
         return jsonify({"error": "Missing required fields"}), 400
-
+    
     try:
         def build_props(email):
             return {
@@ -807,7 +810,8 @@ def assign_homework():
                 "created_at": {"date": {"start": datetime.utcnow().isoformat()}},
                 "created_by": {"rich_text": [{"text": {"content": "professor"}}]}
             }
-
+        
+        # Assign to ALL students
         if student_id == "all":
             students = query_database(USERS_DB_ID)
             count = 0
@@ -816,10 +820,28 @@ def assign_homework():
                     create_page_in_database(HOMEWORK_DB_ID, build_props(s["Email"]))
                     count += 1
             return jsonify({"success": True, "message": f"Assigned to {count} students"})
+        
+        # Assign to a GROUP
+        elif student_id.startswith("group:"):
+            group_name = student_id.replace("group:", "")
+            students = query_database(USERS_DB_ID)
+            count = 0
+            for s in students:
+                student_group = s.get("group") or s.get("Group") or ""
+                if s.get("Email") and student_group == group_name:
+                    create_page_in_database(HOMEWORK_DB_ID, build_props(s["Email"]))
+                    count += 1
+            if count == 0:
+                return jsonify({"error": f"No students found in group '{group_name}'"}), 400
+            return jsonify({"success": True, "message": f"Assigned to {count} students in group {group_name}"})
+        
+        # Assign to INDIVIDUAL student
         else:
             create_page_in_database(HOMEWORK_DB_ID, build_props(student_id))
             return jsonify({"success": True, "message": "Homework assigned"})
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    
+    except Exception as e: 
+        return jsonify({"error": str(e)}), 500
 
 @app.get("/api/student-homework")
 @require_auth

@@ -853,15 +853,30 @@ def complete_homework(homework_id):
 
 @app.get("/api/students-list")
 def get_students_list():
-    """Retorna lista de estudiantes para el dropdown del profesor."""
+    """Retorna lista de estudiantes con grupos para el dropdown del profesor."""
     try:
         users = query_database(USERS_DB_ID)
-        students = [
-            {"id": u.get("Email"), "name": u.get("Name"), "email": u.get("Email")} 
-            for u in users if u.get("Email")
-        ]
-        return jsonify({"students": students})
-    except Exception as e: return jsonify({"error": str(e)}), 500
+        students = []
+        groups = set()
+        
+        for u in users:
+            if u.get("Email"):
+                group = u.get("group") or u.get("Group") or ""
+                students.append({
+                    "id": u.get("Email"),
+                    "name": u.get("Name"),
+                    "email": u.get("Email"),
+                    "group": group
+                })
+                if group:
+                    groups.add(group)
+        
+        return jsonify({
+            "students": students,
+            "groups": sorted(list(groups))
+        })
+    except Exception as e: 
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

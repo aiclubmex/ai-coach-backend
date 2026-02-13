@@ -846,15 +846,72 @@ def assign_homework():
 @app.get("/api/student-homework")
 @require_auth
 def get_student_homework():
-    """Obtiene todas las tareas del estudiante autenticado."""
+    """Obtiene todas las tareas del estudiante autenticado y verifica progreso."""
     try:
+        student_email = request.user["email"]
+        
+        # Get homework
         hw_list = query_database(
             HOMEWORK_DB_ID, 
-            {"property": "student_email", "email": {"equals": request.user["email"]}}, 
+            {"property": "student_email", "email": {"equals": student_email}}, 
             sorts=[{"property": "due_date", "direction": "ascending"}]
         )
-        return jsonify({"homework": hw_list})
-    except Exception as e: return jsonify({"error": str(e)}), 500
+        
+        # Get student's completed activities
+        activities = query_database(
+            ACTIVITY_DB_ID,
+            {"property": "user_email", "email": {"equals": student_email}}
+        )
+        
+        # Find completed problem references
+        completed_problems = set()
+        for act in activities:
+            if act.get("action") == "completed":
+                ref = act.get("problem_reference") or act.get("problem_name")
+                if ref:
+                    completed_problems.add(ref)
+        
+        # Process each homework
+        processed_homework = []
+        for hw in hw_list:
+            hw_data = {
+                "id": hw.get("id"),
+                "title": hw.get("title"),
+                "description": hw.get("description", ""),
+                "due_date": hw.get("due_date"),
+                "points": hw.get("points", 0),
+                "topic": hw.get("topic", ""),
+                "problem_references": hw.get("problem_references", ""),
+                "completed": hw.get("completed", False),
+                "completed_at": hw.get("completed_at")
+            }
+            
+            # Check if all problems are completed
+            if hw_data["problem_references"] and not hw_data["completed"]:
+                refs = [r.strip() for r in hw_data["problem_references"].split(",") if r.strip()]
+                if refs:
+                    solved_count = sum(1 for ref in refs if ref in completed_problems)
+                    hw_data["solved_count"] = solved_count
+                    hw_data["total_problems"] = len(refs)
+                    
+                    # Auto-mark as completed if all problems solved
+                    if solved_count == len(refs):
+                        hw_data["completed"] = True
+                        hw_data["auto_completed"] = True
+                        # Update in Notion
+                        try:
+                            update_page_properties(hw.get("id"), {
+                                "completed": {"checkbox": True},
+                                "completed_at": {"date": {"start": datetime.utcnow().isoformat()}}
+                            })
+                        except:
+                            pass  # Don't fail if update fails
+            
+            processed_homework.append(hw_data)
+        
+        return jsonify({"homework": processed_homework})
+    except Exception as e: 
+        return jsonify({"error": str(e)}), 500
 
 @app.post("/api/complete-homework/<homework_id>")
 @require_auth

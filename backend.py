@@ -161,6 +161,8 @@ def query_database(database_id: str, filter_obj: dict = None, sorts: list = None
                 obj[k] = date_obj.get("start", "") if date_obj else None
             elif ptype == "checkbox":
                 obj[k] = v.get("checkbox", False)
+            elif ptype == "url":
+                obj[k] = v.get("url", "")
         results.append(obj)
     return results
 

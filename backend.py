@@ -775,8 +775,8 @@ def assign_homework():
 @require_auth
 def get_student_homework():
     """
-    Get student homework with late submission detection.
-    UPDATED: Now includes is_late and time_limit_minutes.
+    Get student homework with progress calculation.
+    FIXED: Always calculates solved_count and total_problems.
     """
     try:
         student_email = request.user["email"]
@@ -787,11 +787,13 @@ def get_student_homework():
             sorts=[{"property": "due_date", "direction": "ascending"}]
         )
         
+        # Get ALL completed activities for this student
         activities = query_database(
             ACTIVITY_DB_ID,
             {"property": "user_email", "email": {"equals": student_email}}
         )
         
+        # Build set of completed problem references
         completed_problems = set()
         for act in activities:
             if act.get("action") == "completed":
@@ -799,10 +801,22 @@ def get_student_homework():
                 if ref:
                     completed_problems.add(ref)
         
+        print(f"[HW] Student {student_email} has completed: {completed_problems}")
+        
         processed_homework = []
         now = datetime.now(timezone.utc)
         
         for hw in hw_list:
+            problem_refs_str = hw.get("problem_references", "") or ""
+            
+            # ALWAYS calculate progress, regardless of completed flag
+            refs = [r.strip() for r in problem_refs_str.split(",") if r.strip()]
+            total_problems = len(refs)
+            solved_count = sum(1 for ref in refs if ref in completed_problems)
+            
+            # Determine completion: ALL problems must be solved
+            is_actually_completed = (total_problems > 0 and solved_count >= total_problems)
+            
             hw_data = {
                 "id": hw.get("id"),
                 "title": hw.get("Title") or hw.get("title") or hw.get("name") or "Assignment",
@@ -810,53 +824,37 @@ def get_student_homework():
                 "due_date": hw.get("due_date"),
                 "points": hw.get("points", 0),
                 "topic": hw.get("topic", ""),
-                "problem_references": hw.get("problem_references", ""),
-                "completed": hw.get("completed", False),
-                "completed_at": hw.get("completed_at"),
-                "time_limit_minutes": hw.get("time_limit_minutes", 0),  # NEW
-                "is_late": False  # NEW
+                "problem_references": problem_refs_str,
+                "completed": is_actually_completed,  # Based on actual progress, not Notion flag
+                "completed_at": hw.get("completed_at") if is_actually_completed else None,
+                "time_limit_minutes": hw.get("time_limit_minutes") or 0,
+                "is_late": False,
+                "solved_count": solved_count,
+                "total_problems": total_problems
             }
             
-            # Check if submission is late
-            if hw_data["due_date"] and hw_data["completed_at"]:
+            # Check if submission is late (only for completed homework)
+            if is_actually_completed and hw_data["due_date"]:
                 try:
                     due = datetime.fromisoformat(hw_data["due_date"].replace("Z", "+00:00"))
-                    completed = datetime.fromisoformat(hw_data["completed_at"].replace("Z", "+00:00"))
-                    hw_data["is_late"] = completed > due
-                except:
-                    pass
+                    if hw.get("completed_at"):
+                        completed = datetime.fromisoformat(hw.get("completed_at").replace("Z", "+00:00"))
+                        hw_data["is_late"] = completed > due
+                    else:
+                        # If no completed_at, check if now is past due
+                        hw_data["is_late"] = now > due
+                except Exception as e:
+                    print(f"[HW] Error parsing dates: {e}")
             
             # Check if currently past due (for pending homework)
-            if hw_data["due_date"] and not hw_data["completed"]:
+            if not is_actually_completed and hw_data["due_date"]:
                 try:
                     due = datetime.fromisoformat(hw_data["due_date"].replace("Z", "+00:00"))
                     hw_data["is_overdue"] = now > due
                 except:
                     hw_data["is_overdue"] = False
             
-            # Check progress
-            if hw_data["problem_references"] and not hw_data["completed"]:
-                refs = [r.strip() for r in hw_data["problem_references"].split(",") if r.strip()]
-                if refs:
-                    solved_count = sum(1 for ref in refs if ref in completed_problems)
-                    hw_data["solved_count"] = solved_count
-                    hw_data["total_problems"] = len(refs)
-                    
-                    if solved_count == len(refs):
-                        hw_data["completed"] = True
-                        hw_data["auto_completed"] = True
-                        
-                        # Check if late
-                        if hw_data.get("is_overdue"):
-                            hw_data["is_late"] = True
-                        
-                        try:
-                            update_page_properties(hw.get("id"), {
-                                "completed": {"checkbox": True},
-                                "completed_at": {"date": {"start": datetime.utcnow().isoformat()}}
-                            })
-                        except:
-                            pass
+            print(f"[HW] '{hw_data['title']}': {solved_count}/{total_problems} -> {'COMPLETED' if is_actually_completed else 'PENDING'}")
             
             processed_homework.append(hw_data)
         

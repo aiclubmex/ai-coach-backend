@@ -1056,5 +1056,112 @@ def get_resources_by_topic(topic):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ========================================
+# STUDENT HOMEWORK (for professor view)
+# ========================================
+
+@app.get("/api/student-homework")
+def get_student_homework():
+    """
+    Get all homework assigned to a specific student with their progress.
+    Query param: email (student's email)
+    """
+    email = request.args.get("email", "")
+    if not email:
+        return jsonify({"error": "Email parameter required"}), 400
+    
+    if not HOMEWORK_DB_ID or not ACTIVITY_DB_ID:
+        return jsonify({"error": "Database not configured"}), 500
+    
+    try:
+        # Get all homework
+        all_homework = query_database(HOMEWORK_DB_ID)
+        
+        # Get student's activity
+        student_activities = query_database(
+            ACTIVITY_DB_ID,
+            filter_obj={"property": "user_email", "email": {"equals": email}}
+        )
+        
+        # Build a set of completed problems with scores and times
+        completed_problems = {}
+        for act in student_activities:
+            if act.get("action") == "completed":
+                ref = act.get("problem_reference") or act.get("problem_name", "")
+                if ref and ref not in completed_problems:
+                    completed_problems[ref] = {
+                        "score": act.get("score"),
+                        "time_spent_seconds": act.get("time_spent_seconds"),
+                        "timestamp": act.get("timestamp")
+                    }
+        
+        # Filter homework for this student
+        student_homework = []
+        for hw in all_homework:
+            assigned_to = hw.get("assigned_to", "")
+            # Check if assigned to all or to this specific student
+            if assigned_to == "all" or email in assigned_to:
+                # Parse problem references
+                refs_str = hw.get("problem_references", "")
+                refs = [r.strip() for r in refs_str.split(",") if r.strip()]
+                
+                # Calculate progress
+                solved_count = 0
+                problem_solutions = []
+                
+                for ref in refs:
+                    if ref in completed_problems:
+                        solved_count += 1
+                        problem_solutions.append({
+                            "problem_reference": ref,
+                            "score": completed_problems[ref]["score"],
+                            "time_spent_seconds": completed_problems[ref]["time_spent_seconds"],
+                            "timestamp": completed_problems[ref]["timestamp"]
+                        })
+                    else:
+                        problem_solutions.append({
+                            "problem_reference": ref,
+                            "score": None,
+                            "time_spent_seconds": None,
+                            "timestamp": None
+                        })
+                
+                is_completed = solved_count >= len(refs) and len(refs) > 0
+                
+                # Check for late submission
+                due_date = hw.get("due_date")
+                late_submission = False
+                if is_completed and due_date:
+                    # Find the latest completion timestamp
+                    completion_times = [
+                        ps["timestamp"] for ps in problem_solutions 
+                        if ps["timestamp"]
+                    ]
+                    if completion_times:
+                        last_completion = max(completion_times)
+                        if last_completion > due_date:
+                            late_submission = True
+                
+                student_homework.append({
+                    "id": hw.get("id"),
+                    "title": hw.get("title", "Homework"),
+                    "description": hw.get("description", ""),
+                    "due_date": due_date,
+                    "points": hw.get("points"),
+                    "problem_references": refs_str,
+                    "total_problems": len(refs),
+                    "solved_count": solved_count,
+                    "completed": is_completed,
+                    "late_submission": late_submission,
+                    "problem_solutions": problem_solutions
+                })
+        
+        # Sort by due date (most recent first)
+        student_homework.sort(key=lambda x: x.get("due_date") or "", reverse=True)
+        
+        return jsonify({"homework": student_homework})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

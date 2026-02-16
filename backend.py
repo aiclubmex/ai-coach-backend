@@ -32,6 +32,7 @@ FRONTEND_ORIGIN     = os.environ.get("FRONTEND_ORIGIN", "https://aiclub.com.mx")
 USERS_DB_ID         = os.environ.get("USERS_DB_ID", "")
 ACTIVITY_DB_ID      = os.environ.get("ACTIVITY_DB_ID", "")
 HOMEWORK_DB_ID      = os.environ.get("HOMEWORK_DB_ID", "")
+RESOURCES_DB_ID     = os.environ.get("RESOURCES_DB_ID", "")  # Resources by Topic
 JWT_SECRET_KEY      = os.environ.get("JWT_SECRET_KEY", "change-this-secret-key-in-production")
 
 # ==============================
@@ -973,5 +974,85 @@ def get_homework_details(homework_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ========================================
+# RESOURCES BY TOPIC
+# ========================================
+
+@app.get("/api/resources")
+def get_all_resources():
+    """
+    Get all resources by topic.
+    Returns a dictionary with topic as key and resources as value.
+    """
+    if not RESOURCES_DB_ID:
+        return jsonify({"error": "RESOURCES_DB_ID not configured"}), 500
+    
+    try:
+        resources = query_database(RESOURCES_DB_ID)
+        
+        result = {}
+        for r in resources:
+            topic = r.get("topic") or r.get("Topic") or r.get("name") or ""
+            if not topic:
+                continue
+            
+            result[topic] = {
+                "study_guide_url": r.get("study_guide_url") or None,
+                "formula_sheet_url": r.get("formula_sheet_url") or None,
+                "audio_url": r.get("audio_url") or None,
+                "hints": r.get("hints") or None,
+                "common_mistakes": r.get("common_mistakes") or None
+            }
+        
+        return jsonify({"resources": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.get("/api/resources/<topic>")
+def get_resources_by_topic(topic):
+    """
+    Get resources for a specific topic.
+    """
+    if not RESOURCES_DB_ID:
+        return jsonify({"error": "RESOURCES_DB_ID not configured"}), 500
+    
+    try:
+        # Query with filter for specific topic
+        resources = query_database(
+            RESOURCES_DB_ID,
+            filter_obj={
+                "property": "topic",
+                "title": {"equals": topic}
+            }
+        )
+        
+        if not resources:
+            # Try case-insensitive search
+            all_resources = query_database(RESOURCES_DB_ID)
+            for r in all_resources:
+                r_topic = r.get("topic") or r.get("Topic") or r.get("name") or ""
+                if r_topic.lower() == topic.lower():
+                    return jsonify({
+                        "topic": r_topic,
+                        "study_guide_url": r.get("study_guide_url") or None,
+                        "formula_sheet_url": r.get("formula_sheet_url") or None,
+                        "audio_url": r.get("audio_url") or None,
+                        "hints": r.get("hints") or None,
+                        "common_mistakes": r.get("common_mistakes") or None
+                    })
+            return jsonify({"error": "Topic not found"}), 404
+        
+        r = resources[0]
+        return jsonify({
+            "topic": topic,
+            "study_guide_url": r.get("study_guide_url") or None,
+            "formula_sheet_url": r.get("formula_sheet_url") or None,
+            "audio_url": r.get("audio_url") or None,
+            "hints": r.get("hints") or None,
+            "common_mistakes": r.get("common_mistakes") or None
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True) 
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

@@ -1060,11 +1060,12 @@ def get_resources_by_topic(topic):
 # STUDENT HOMEWORK (for professor view)
 # ========================================
 
-@app.get("/api/student-homework")
-def get_student_homework():
+@app.get("/api/professor/student-homework")
+def get_student_homework_for_professor():
     """
     Get all homework assigned to a specific student with their progress.
     Query param: email (student's email)
+    Used by professor dashboard.
     """
     email = request.args.get("email", "")
     if not email:

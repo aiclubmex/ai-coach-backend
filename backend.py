@@ -1,27 +1,10 @@
-# backend.py
-# Flask API for Physics AI Coach
-# - GET /                -> health
-# - GET /problems        -> list problems from Notion (NOW FULLY PAGINATED)
-# - GET /problem/<id>    -> full fields for one problem
-# - GET /steps/<id>      -> step-by-step plan (Notion or auto-LLM)
-# - POST /chat           -> checks a student's step / next hint
-# 
-# ========================================
-# *** MULTIUSER SYSTEM - ADDED 2 FEB 2026 ***
-# - POST /api/register           -> register new user
-# - POST /api/login              -> login user
-# - GET  /api/verify-session     -> verify JWT token
-# - POST /api/track-activity     -> track user activity
-# - GET  /api/user-progress      -> get current user progress
-# - GET  /api/user-stats         -> get user stats for student dashboard
-# - GET  /api/all-users          -> get all users (admin only)
-# ========================================
-# *** HOMEWORK SYSTEM - ADDED 11 FEB 2026 ***
-# - POST /api/assign-homework          -> assign homework to students
-# - GET  /api/student-homework         -> get student's homework
-# - POST /api/complete-homework/<id>   -> mark homework as complete
-# - GET  /api/students-list            -> get students for dropdown
-# ========================================
+# backend.py - AI Coach Physics Backend v2
+# ==========================================
+# ACTUALIZADO: 16 Feb 2026
+# - Agregado: solution_text en track-activity
+# - Agregado: time_limit_minutes en assign-homework
+# - Agregado: late_submission detection
+# ==========================================
 
 import os, re, json, uuid
 from typing import List, Dict, Any
@@ -29,19 +12,15 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 from functools import wraps
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-# ========================================
-# *** NEW: Import for authentication ***
-# ========================================
 try:
     import bcrypt
     import jwt
     AUTH_AVAILABLE = True
 except ImportError:
     AUTH_AVAILABLE = False
-    print("[WARNING] bcrypt or PyJWT not installed. Auth endpoints will not work.")
-    print("[WARNING] Install with: pip install bcrypt PyJWT")
+    print("[WARNING] bcrypt or PyJWT not installed.")
 
 # ==============================
 # ENV
@@ -50,10 +29,6 @@ NOTION_API_KEY      = os.environ.get("NOTION_API_KEY", "")
 NOTION_DB_ID        = os.environ.get("NOTION_DATABASE_ID", "")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 FRONTEND_ORIGIN     = os.environ.get("FRONTEND_ORIGIN", "https://aiclub.com.mx")
-
-# ========================================
-# *** NEW: Environment variables for multiuser system ***
-# ========================================
 USERS_DB_ID         = os.environ.get("USERS_DB_ID", "")
 ACTIVITY_DB_ID      = os.environ.get("ACTIVITY_DB_ID", "")
 HOMEWORK_DB_ID      = os.environ.get("HOMEWORK_DB_ID", "")
@@ -85,18 +60,14 @@ NOTION_HEADERS = {
 UUID_RE = re.compile(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 def sanitize_uuid(value: str) -> str:
-    """Return a Notion-acceptable UUID (with hyphens) or empty if not found."""
     match = UUID_RE.search(value)
-    if not match:
-        return ""
+    if not match: return ""
     raw = match.group(0).replace("-", "")
     return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
 
 def fetch_page(page_id: str) -> Dict[str, Any]:
-    """Retrieve a single Notion page by ID."""
     pid = sanitize_uuid(page_id)
-    if not pid:
-        raise ValueError("Invalid page ID")
+    if not pid: raise ValueError("Invalid page ID")
     
     url = f"{NOTION_BASE}/pages/{pid}"
     resp = requests.get(url, headers=NOTION_HEADERS, timeout=10)
@@ -130,23 +101,18 @@ def fetch_page(page_id: str) -> Dict[str, Any]:
             out[k] = v.get("email", "")
         elif ptype == "date":
             date_obj = v.get("date")
-            if date_obj:
-                out[k] = date_obj.get("start", "")
-            else:
-                out[k] = None
+            out[k] = date_obj.get("start", "") if date_obj else None
         elif ptype == "checkbox":
             out[k] = v.get("checkbox", False)
     
     return out
 
 def query_database(database_id: str, filter_obj: dict = None, sorts: list = None) -> List[Dict[str, Any]]:
-    """Query a Notion database with full pagination (brings ALL results)."""
     if database_id in [USERS_DB_ID, ACTIVITY_DB_ID, HOMEWORK_DB_ID]:
         db_id = database_id
     else:
         db_id = sanitize_uuid(database_id)
-        if not db_id:
-            raise ValueError("Invalid database ID")
+        if not db_id: raise ValueError("Invalid database ID")
     
     url = f"{NOTION_BASE}/databases/{db_id}/query"
     all_pages = []
@@ -198,13 +164,11 @@ def query_database(database_id: str, filter_obj: dict = None, sorts: list = None
     return results
 
 def create_page_in_database(database_id: str, properties: dict) -> dict:
-    """Create a new page in a Notion database."""
     if database_id in [USERS_DB_ID, ACTIVITY_DB_ID, HOMEWORK_DB_ID]:
         db_id = database_id
     else:
         db_id = sanitize_uuid(database_id)
-        if not db_id:
-            raise ValueError("Invalid database ID")
+        if not db_id: raise ValueError("Invalid database ID")
     
     url = f"{NOTION_BASE}/pages"
     payload = {"parent": {"database_id": db_id}, "properties": properties}
@@ -213,14 +177,11 @@ def create_page_in_database(database_id: str, properties: dict) -> dict:
     return resp.json()
 
 def update_page_properties(page_id: str, properties: dict) -> dict:
-    """Update properties of an existing Notion page."""
     pid = sanitize_uuid(page_id)
-    if not pid:
-        raise ValueError("Invalid page ID")
+    if not pid: raise ValueError("Invalid page ID")
     
     url = f"{NOTION_BASE}/pages/{pid}"
     payload = {"properties": properties}
-    
     resp = requests.patch(url, headers=NOTION_HEADERS, json=payload, timeout=10)
     resp.raise_for_status()
     return resp.json()
@@ -323,7 +284,7 @@ def require_auth(f):
 # Base Routes
 # ==============================
 @app.get("/")
-def index(): return jsonify({"status": "ok", "service": "ai-coach-backend"})
+def index(): return jsonify({"status": "ok", "service": "ai-coach-backend", "version": "2.0"})
 
 @app.get("/problems")
 def list_problems():
@@ -349,10 +310,6 @@ def get_steps(problem_id: str):
 
 @app.post("/submit-solution")
 def submit_solution():
-    """
-    Evaluate student's solution using Claude API.
-    Returns score and feedback.
-    """
     data = request.get_json(force=True, silent=True) or {}
     problem_id = data.get("problem_id")
     solution_text = data.get("solution_text", "")
@@ -364,10 +321,8 @@ def submit_solution():
     print(f"[SUBMIT] Evaluating solution for problem: {problem_id}")
     
     try:
-        # Get problem details
         problem = fetch_page(problem_id)
         
-        # Build evaluation prompt
         prompt = f"""You are an IB Physics HL examiner. Evaluate this student's solution.
 
 Problem: {problem.get('name', '')}
@@ -385,11 +340,8 @@ Evaluate the solution and respond with a JSON object:
   "feedback": "<detailed feedback explaining what's correct/incorrect>",
   "time_taken": "{time_spent // 60}:{time_spent % 60:02d}"
 }}
-
-Be specific about what's correct and what needs improvement.
 """
         
-        # Call Claude API
         if not ANTHROPIC_API_KEY:
             return jsonify({
                 "score": 50,
@@ -400,31 +352,20 @@ Be specific about what's correct and what needs improvement.
         
         response_text = call_anthropic_api(prompt, max_tokens=1024)
         
-        # Parse response
-        import json
-        # Remove markdown code blocks if present
         clean_response = response_text.strip()
         if clean_response.startswith('```'):
             clean_response = '\n'.join(clean_response.split('\n')[1:-1])
         
         result = json.loads(clean_response)
-        
-        # Ensure required fields
         result.setdefault('score', 50)
         result.setdefault('correct', result.get('score', 0) >= 70)
         result.setdefault('feedback', 'Solution evaluated.')
         result.setdefault('time_taken', f"{time_spent // 60}:{time_spent % 60:02d}")
         
-        print(f"[SUBMIT] Score: {result['score']}, Correct: {result['correct']}")
-        
         return jsonify(result), 200
         
     except Exception as e:
         print(f"[ERROR] Submit solution failed: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Fallback response
         return jsonify({
             "score": 50,
             "correct": False,
@@ -434,11 +375,10 @@ Be specific about what's correct and what needs improvement.
 
 @app.post("/chat")
 def chat():
-    # (Omitido por brevedad - mantiene lógica original)
     return jsonify({"reply": "I am your AI Physics tutor."})
 
 # ========================================
-# *** MULTIUSER AUTHENTICATION ***
+# MULTIUSER AUTHENTICATION
 # ========================================
 
 @app.post("/api/register")
@@ -447,18 +387,31 @@ def register():
     email = data.get("email", "").strip().lower()
     name = data.get("name", "").strip()
     password = data.get("password", "")
-    if not email or not name or not password: return jsonify({"error": "Missing fields"}), 400
-    if not email.endswith("@asf.edu.mx"): return jsonify({"error": "Use ASF email"}), 400
+    group = data.get("group", "").strip()  # NEW: group field
+    
+    if not email or not name or not password: 
+        return jsonify({"error": "Missing fields"}), 400
+    if not email.endswith("@asf.edu.mx"): 
+        return jsonify({"error": "Use ASF email"}), 400
+    
     password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    
     try:
-        create_page_in_database(USERS_DB_ID, {
+        properties = {
             "Name": {"title": [{"text": {"content": name}}]},
             "Email": {"email": email},
             "password_hash": {"rich_text": [{"text": {"content": password_hash}}]},
             "created_at": {"date": {"start": datetime.utcnow().isoformat()}}
-        })
+        }
+        
+        # Add group if provided
+        if group:
+            properties["group"] = {"select": {"name": group}}
+        
+        create_page_in_database(USERS_DB_ID, properties)
         return jsonify({"success": True}), 201
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e: 
+        return jsonify({"error": str(e)}), 500
 
 @app.post("/api/login")
 def login():
@@ -476,33 +429,70 @@ def login():
 def verify_session():
     return jsonify({"valid": True, "user": {"email": request.user["email"], "name": request.user["name"]}})
 
+# ========================================
+# TRACK ACTIVITY - UPDATED WITH solution_text
+# ========================================
+
+@app.post("/api/track-activity")
+@require_auth
+def track_activity():
+    """
+    Track student activity with full solution text.
+    UPDATED: Now saves solution_text for professor review.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    
+    properties = {
+        "problem_name": {"title": [{"text": {"content": data.get("problem_name", "")}}]},
+        "user_email": {"email": request.user["email"]},
+        "action": {"select": {"name": data.get("action", "opened")}},
+        "timestamp": {"date": {"start": datetime.utcnow().isoformat()}}
+    }
+    
+    if data.get("problem_reference"):
+        properties["problem_reference"] = {"rich_text": [{"text": {"content": data.get("problem_reference", "")}}]}
+    
+    if data.get("score") is not None:
+        properties["score"] = {"number": data.get("score", 0)}
+    
+    if data.get("time_spent_seconds") is not None:
+        properties["time_spent_seconds"] = {"number": data.get("time_spent_seconds", 0)}
+    
+    # ========================================
+    # NEW: Save solution_text for professor review
+    # ========================================
+    if data.get("solution_text"):
+        # Notion rich_text has a 2000 character limit per block
+        solution = data.get("solution_text", "")[:2000]
+        properties["solution_text"] = {"rich_text": [{"text": {"content": solution}}]}
+    
+    try:
+        create_page_in_database(ACTIVITY_DB_ID, properties)
+        return jsonify({"success": True})
+    except Exception as e: 
+        print(f"[ERROR] Track activity failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ========================================
+# USER STATS & PROGRESS
+# ========================================
+
 @app.get("/api/user-stats")
 @require_auth
 def user_stats():
-    """
-    Get statistics for the current authenticated user.
-    Used by the Student Dashboard.
-    """
     if not ACTIVITY_DB_ID:
         return jsonify({"error": "ACTIVITY_DB_ID not configured"}), 500
     
     user = request.user
     email = user.get("email")
     
-    print(f"[STATS] Getting stats for: {email}")
-    
     try:
-        # Get all activities for this user
         activities = query_database(
             ACTIVITY_DB_ID,
-            filter_obj={
-                "property": "user_email",
-                "email": {"equals": email}
-            },
+            filter_obj={"property": "user_email", "email": {"equals": email}},
             sorts=[{"property": "timestamp", "direction": "descending"}]
         )
         
-        # Calculate statistics
         total_time = 0
         problems_completed = set()
         scores = []
@@ -519,7 +509,6 @@ def user_stats():
                 if score > 0:
                     scores.append(score)
         
-        # Build recent activity list (last 10)
         recent_activity = []
         for activity in activities[:10]:
             if activity.get("action") in ["completed", "submitted"]:
@@ -540,67 +529,24 @@ def user_stats():
         
     except Exception as e:
         print(f"[ERROR] Failed to get user stats: {e}")
-        import traceback
-        traceback.print_exc()
         return jsonify({"error": f"Failed to get stats: {str(e)}"}), 500
-
-@app.post("/api/track-activity")
-@require_auth
-def track_activity():
-    data = request.get_json(force=True, silent=True) or {}
-    
-    # Build properties for Notion
-    properties = {
-        "problem_name": {"title": [{"text": {"content": data.get("problem_name", "")}}]},
-        "user_email": {"email": request.user["email"]},
-        "action": {"select": {"name": data.get("action", "opened")}},
-        "timestamp": {"date": {"start": datetime.utcnow().isoformat()}}
-    }
-    
-    # Add optional fields if present
-    if data.get("problem_reference"):
-        properties["problem_reference"] = {"rich_text": [{"text": {"content": data.get("problem_reference", "")}}]}
-    
-    if data.get("score") is not None:
-        properties["score"] = {"number": data.get("score", 0)}
-    
-    if data.get("time_spent_seconds") is not None:
-        properties["time_spent_seconds"] = {"number": data.get("time_spent_seconds", 0)}
-    
-    try:
-        create_page_in_database(ACTIVITY_DB_ID, properties)
-        return jsonify({"success": True})
-    except Exception as e: 
-        print(f"[ERROR] Track activity failed: {e}")
-        return jsonify({"error": str(e)}), 500
 
 @app.get("/api/user-progress")
 @require_auth
 def user_progress():
-    """
-    Get progress for current user.
-    Returns statistics from Activity Log.
-    """
     if not ACTIVITY_DB_ID:
         return jsonify({"error": "ACTIVITY_DB_ID not configured"}), 500
     
     user = request.user
     email = user.get("email")
     
-    print(f"[PROGRESS] Getting progress for: {email}")
-    
-    # Get all activities for this user
     try:
         activities = query_database(
             ACTIVITY_DB_ID,
-            filter_obj={
-                "property": "user_email",
-                "email": {"equals": email}
-            },
+            filter_obj={"property": "user_email", "email": {"equals": email}},
             sorts=[{"property": "timestamp", "direction": "descending"}]
         )
         
-        # Calculate statistics
         total_time = 0
         problems_attempted = set()
         problems_completed = set()
@@ -612,7 +558,7 @@ def user_progress():
             time_spent = activity.get("time_spent_seconds", 0) or 0
             score = activity.get("score", 0) or 0
             
-            if action == "started" or action == "opened":
+            if action in ["started", "opened"]:
                 problems_attempted.add(problem_id)
             
             if action == "completed":
@@ -621,7 +567,6 @@ def user_progress():
                 if score > 0:
                     scores.append(score)
         
-        # Get recent activities (last 10)
         recent = activities[:10] if len(activities) > 10 else activities
         
         return jsonify({
@@ -638,43 +583,35 @@ def user_progress():
         print(f"[ERROR] Failed to get progress: {e}")
         return jsonify({"error": f"Failed to get progress: {str(e)}"}), 500
 
+# ========================================
+# ALL USERS (PROFESSOR VIEW) - WITH SOLUTION TEXT
+# ========================================
+
 @app.get("/api/all-users")
 def all_users():
     """
-    Get all users and their progress with recent activities.
-    FOR ADMIN/PROFESSOR USE ONLY.
+    Get all users with their progress and solution texts.
+    UPDATED: Now includes solution_text in recent_activities.
     """
     if not USERS_DB_ID or not ACTIVITY_DB_ID:
         return jsonify({"error": "Databases not configured"}), 500
     
-    print(f"[ADMIN] Getting all users")
-    
     try:
-        # Get all users
         users = query_database(USERS_DB_ID)
-        print(f"[ADMIN] Found {len(users)} users")
-        
-        # Get all activities
         all_activities = query_database(ACTIVITY_DB_ID)
-        print(f"[ADMIN] Found {len(all_activities)} activities")
         
-        # Build stats per user
         user_stats_list = []
         
         for user in users:
             email = user.get("Email", "")
             name = user.get("Name", "")
+            group = user.get("group") or user.get("Group") or ""
             
-            if not email:
-                continue
+            if not email: continue
             
-            # Filter activities for this user
             user_activities = [a for a in all_activities if a.get("user_email") == email]
-            
-            # Sort by timestamp descending
             user_activities.sort(key=lambda x: x.get("timestamp", "") or "", reverse=True)
             
-            # Calculate stats
             total_time = 0
             problems_attempted = set()
             problems_completed = set()
@@ -700,22 +637,23 @@ def all_users():
                 if timestamp and (not last_active or timestamp > last_active):
                     last_active = timestamp
             
-            # Get recent activities (last 10) for detail view
+            # Include solution_text in recent activities for professor review
             recent_activities = []
             for activity in user_activities[:10]:
-                # Prefer problem_reference over problem_name for display
                 display_name = activity.get("problem_reference") or activity.get("problem_name", "Unknown")
                 recent_activities.append({
                     "problem_name": display_name,
                     "action": activity.get("action", "opened"),
                     "score": activity.get("score", 0) or 0,
                     "time_spent_seconds": activity.get("time_spent_seconds", 0) or 0,
-                    "timestamp": activity.get("timestamp", "")
+                    "timestamp": activity.get("timestamp", ""),
+                    "solution_text": activity.get("solution_text", "")  # NEW
                 })
             
             user_stats_list.append({
                 "email": email,
                 "name": name,
+                "group": group,
                 "last_active": last_active,
                 "problems_attempted": len(problems_attempted),
                 "problems_completed": len(problems_completed),
@@ -724,35 +662,24 @@ def all_users():
                 "recent_activities": recent_activities
             })
         
-        # Calculate overall stats
         total_students = len(user_stats_list)
         
-        # Calculate active_today safely
         active_today = 0
         for u in user_stats_list:
             if u.get("last_active"):
                 try:
-                    from datetime import timezone
                     last_active_str = u["last_active"].replace("Z", "+00:00")
                     last_active_dt = datetime.fromisoformat(last_active_str)
                     now_utc = datetime.now(timezone.utc)
                     diff = now_utc - last_active_dt
                     if diff.days == 0:
                         active_today += 1
-                except Exception as e:
-                    print(f"[WARN] Could not parse last_active: {e}")
-                    continue
+                except: continue
         
         problems_solved = sum(u["problems_completed"] for u in user_stats_list)
         
-        # Calculate avg_score safely
         users_with_scores = [u for u in user_stats_list if u["avg_score"] > 0]
-        if users_with_scores:
-            avg_score = round(sum(u["avg_score"] for u in users_with_scores) / len(users_with_scores), 1)
-        else:
-            avg_score = 0
-        
-        print(f"[ADMIN] Returning {total_students} students with activities")
+        avg_score = round(sum(u["avg_score"] for u in users_with_scores) / len(users_with_scores), 1) if users_with_scores else 0
         
         return jsonify({
             "total_students": total_students,
@@ -768,21 +695,18 @@ def all_users():
         traceback.print_exc()
         return jsonify({"error": f"Failed to get users: {str(e)}"}), 500
 
-
 # ============================================================================
-# SISTEMA DE TAREAS/HOMEWORK - ENDPOINTS CON PROBLEM_REFERENCES
+# HOMEWORK SYSTEM - UPDATED WITH time_limit_minutes
 # ============================================================================
 
 @app.post("/api/assign-homework")
 def assign_homework():
     """
-    Asigna una tarea a un estudiante específico, a un grupo, o a todos los estudiantes.
-    Soporta:
-    - student_id = "all" -> todos los estudiantes
-    - student_id = "group:IB HL" -> todos los estudiantes del grupo "IB HL"
-    - student_id = "email@example.com" -> estudiante individual
+    Assign homework with optional time limit.
+    UPDATED: Now supports time_limit_minutes field.
     """
-    if not HOMEWORK_DB_ID: return jsonify({"error": "HOMEWORK_DB_ID missing"}), 500
+    if not HOMEWORK_DB_ID: 
+        return jsonify({"error": "HOMEWORK_DB_ID missing"}), 500
     
     data = request.get_json(force=True, silent=True) or request.form.to_dict()
     student_id = data.get("student_id")
@@ -792,14 +716,15 @@ def assign_homework():
     points = int(data.get("points", 0))
     topic = data.get("topic", "")
     problem_references = data.get("problem_references", "")
+    time_limit_minutes = int(data.get("time_limit_minutes", 0))  # NEW
     
     if not title or not student_id or not due_date:
         return jsonify({"error": "Missing required fields"}), 400
     
     try:
         def build_props(email):
-            return {
-                "title": {"title": [{"text": {"content": title}}]},
+            props = {
+                "Title": {"title": [{"text": {"content": title}}]},
                 "student_email": {"email": email},
                 "description": {"rich_text": [{"text": {"content": description}}]},
                 "due_date": {"date": {"start": due_date}},
@@ -810,8 +735,13 @@ def assign_homework():
                 "created_at": {"date": {"start": datetime.utcnow().isoformat()}},
                 "created_by": {"rich_text": [{"text": {"content": "professor"}}]}
             }
+            
+            # NEW: Add time limit if specified
+            if time_limit_minutes > 0:
+                props["time_limit_minutes"] = {"number": time_limit_minutes}
+            
+            return props
         
-        # Assign to ALL students
         if student_id == "all":
             students = query_database(USERS_DB_ID)
             count = 0
@@ -821,7 +751,6 @@ def assign_homework():
                     count += 1
             return jsonify({"success": True, "message": f"Assigned to {count} students"})
         
-        # Assign to a GROUP
         elif student_id.startswith("group:"):
             group_name = student_id.replace("group:", "")
             students = query_database(USERS_DB_ID)
@@ -835,7 +764,6 @@ def assign_homework():
                 return jsonify({"error": f"No students found in group '{group_name}'"}), 400
             return jsonify({"success": True, "message": f"Assigned to {count} students in group {group_name}"})
         
-        # Assign to INDIVIDUAL student
         else:
             create_page_in_database(HOMEWORK_DB_ID, build_props(student_id))
             return jsonify({"success": True, "message": "Homework assigned"})
@@ -846,24 +774,24 @@ def assign_homework():
 @app.get("/api/student-homework")
 @require_auth
 def get_student_homework():
-    """Obtiene todas las tareas del estudiante autenticado y verifica progreso."""
+    """
+    Get student homework with late submission detection.
+    UPDATED: Now includes is_late and time_limit_minutes.
+    """
     try:
         student_email = request.user["email"]
         
-        # Get homework
         hw_list = query_database(
             HOMEWORK_DB_ID, 
             {"property": "student_email", "email": {"equals": student_email}}, 
             sorts=[{"property": "due_date", "direction": "ascending"}]
         )
         
-        # Get student's completed activities
         activities = query_database(
             ACTIVITY_DB_ID,
             {"property": "user_email", "email": {"equals": student_email}}
         )
         
-        # Find completed problem references
         completed_problems = set()
         for act in activities:
             if act.get("action") == "completed":
@@ -871,8 +799,9 @@ def get_student_homework():
                 if ref:
                     completed_problems.add(ref)
         
-        # Process each homework
         processed_homework = []
+        now = datetime.now(timezone.utc)
+        
         for hw in hw_list:
             hw_data = {
                 "id": hw.get("id"),
@@ -883,10 +812,29 @@ def get_student_homework():
                 "topic": hw.get("topic", ""),
                 "problem_references": hw.get("problem_references", ""),
                 "completed": hw.get("completed", False),
-                "completed_at": hw.get("completed_at")
+                "completed_at": hw.get("completed_at"),
+                "time_limit_minutes": hw.get("time_limit_minutes", 0),  # NEW
+                "is_late": False  # NEW
             }
             
-            # Check if all problems are completed
+            # Check if submission is late
+            if hw_data["due_date"] and hw_data["completed_at"]:
+                try:
+                    due = datetime.fromisoformat(hw_data["due_date"].replace("Z", "+00:00"))
+                    completed = datetime.fromisoformat(hw_data["completed_at"].replace("Z", "+00:00"))
+                    hw_data["is_late"] = completed > due
+                except:
+                    pass
+            
+            # Check if currently past due (for pending homework)
+            if hw_data["due_date"] and not hw_data["completed"]:
+                try:
+                    due = datetime.fromisoformat(hw_data["due_date"].replace("Z", "+00:00"))
+                    hw_data["is_overdue"] = now > due
+                except:
+                    hw_data["is_overdue"] = False
+            
+            # Check progress
             if hw_data["problem_references"] and not hw_data["completed"]:
                 refs = [r.strip() for r in hw_data["problem_references"].split(",") if r.strip()]
                 if refs:
@@ -894,18 +842,21 @@ def get_student_homework():
                     hw_data["solved_count"] = solved_count
                     hw_data["total_problems"] = len(refs)
                     
-                    # Auto-mark as completed if all problems solved
                     if solved_count == len(refs):
                         hw_data["completed"] = True
                         hw_data["auto_completed"] = True
-                        # Update in Notion
+                        
+                        # Check if late
+                        if hw_data.get("is_overdue"):
+                            hw_data["is_late"] = True
+                        
                         try:
                             update_page_properties(hw.get("id"), {
                                 "completed": {"checkbox": True},
                                 "completed_at": {"date": {"start": datetime.utcnow().isoformat()}}
                             })
                         except:
-                            pass  # Don't fail if update fails
+                            pass
             
             processed_homework.append(hw_data)
         
@@ -916,23 +867,36 @@ def get_student_homework():
 @app.post("/api/complete-homework/<homework_id>")
 @require_auth
 def complete_homework(homework_id):
-    """Marca una tarea como completada y devuelve los puntos."""
     try:
         hw = fetch_page(homework_id)
         if hw.get("student_email") != request.user["email"]: 
             return jsonify({"error": "Forbidden"}), 403
+        
+        # Check if late
+        is_late = False
+        if hw.get("due_date"):
+            try:
+                due = datetime.fromisoformat(hw["due_date"].replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                is_late = now > due
+            except:
+                pass
         
         update_page_properties(homework_id, {
             "completed": {"checkbox": True},
             "completed_at": {"date": {"start": datetime.utcnow().isoformat()}}
         })
         
-        return jsonify({"success": True, "points_earned": hw.get("points", 0)})
-    except Exception as e: return jsonify({"error": str(e)}), 500
+        return jsonify({
+            "success": True, 
+            "points_earned": hw.get("points", 0),
+            "is_late": is_late
+        })
+    except Exception as e: 
+        return jsonify({"error": str(e)}), 500
 
 @app.get("/api/students-list")
 def get_students_list():
-    """Retorna lista de estudiantes con grupos para el dropdown del profesor."""
     try:
         users = query_database(USERS_DB_ID)
         students = []
@@ -955,6 +919,60 @@ def get_students_list():
             "groups": sorted(list(groups))
         })
     except Exception as e: 
+        return jsonify({"error": str(e)}), 500
+
+# ============================================================================
+# NEW: Get homework details for professor (with student solutions)
+# ============================================================================
+
+@app.get("/api/homework-details/<homework_id>")
+def get_homework_details(homework_id):
+    """
+    Get detailed homework info including student's solution text.
+    For professor to review student work.
+    """
+    try:
+        hw = fetch_page(homework_id)
+        student_email = hw.get("student_email")
+        problem_refs = hw.get("problem_references", "")
+        
+        # Get student's activities for these problems
+        if student_email and problem_refs:
+            activities = query_database(
+                ACTIVITY_DB_ID,
+                {"property": "user_email", "email": {"equals": student_email}}
+            )
+            
+            refs = [r.strip() for r in problem_refs.split(",") if r.strip()]
+            problem_solutions = []
+            
+            for ref in refs:
+                # Find the latest completed activity for this problem
+                for act in sorted(activities, key=lambda x: x.get("timestamp", ""), reverse=True):
+                    act_ref = act.get("problem_reference") or act.get("problem_name", "")
+                    if act_ref == ref and act.get("action") == "completed":
+                        problem_solutions.append({
+                            "problem_reference": ref,
+                            "score": act.get("score", 0),
+                            "time_spent_seconds": act.get("time_spent_seconds", 0),
+                            "solution_text": act.get("solution_text", ""),
+                            "timestamp": act.get("timestamp", "")
+                        })
+                        break
+                else:
+                    # Problem not completed yet
+                    problem_solutions.append({
+                        "problem_reference": ref,
+                        "score": None,
+                        "time_spent_seconds": None,
+                        "solution_text": None,
+                        "timestamp": None
+                    })
+            
+            hw["problem_solutions"] = problem_solutions
+        
+        return jsonify({"homework": hw})
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":

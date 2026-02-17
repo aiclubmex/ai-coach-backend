@@ -779,7 +779,7 @@ def assign_homework():
 def get_student_homework():
     """
     Get student homework with progress calculation.
-    FIXED: Always calculates solved_count and total_problems.
+    FIXED: Only counts completions AFTER homework was assigned.
     """
     try:
         student_email = request.user["email"]
@@ -790,34 +790,75 @@ def get_student_homework():
             sorts=[{"property": "due_date", "direction": "ascending"}]
         )
         
-        # Get ALL completed activities for this student
+        # Get ALL completed activities for this student with timestamps
         activities = query_database(
             ACTIVITY_DB_ID,
             {"property": "user_email", "email": {"equals": student_email}}
         )
         
-        # Build set of completed problem references
-        completed_problems = set()
+        # Build dict of completed problems with their timestamps
+        # Key: problem_reference, Value: list of completion timestamps
+        completed_problems = {}
         for act in activities:
             if act.get("action") == "completed":
                 ref = act.get("problem_reference") or act.get("problem_name")
-                if ref:
-                    completed_problems.add(ref)
+                timestamp = act.get("timestamp")
+                if ref and timestamp:
+                    if ref not in completed_problems:
+                        completed_problems[ref] = []
+                    completed_problems[ref].append(timestamp)
         
-        print(f"[HW] Student {student_email} has completed: {completed_problems}")
+        print(f"[HW] Student {student_email} has completed: {list(completed_problems.keys())}")
         
         processed_homework = []
         now = datetime.now(timezone.utc)
         
         for hw in hw_list:
             problem_refs_str = hw.get("problem_references", "") or ""
+            hw_created_at = hw.get("created_at") or ""
+            
+            # Parse homework creation date
+            hw_created_datetime = None
+            if hw_created_at:
+                try:
+                    hw_created_datetime = datetime.fromisoformat(hw_created_at.replace("Z", "+00:00"))
+                except:
+                    pass
             
             # ALWAYS calculate progress, regardless of completed flag
             refs = [r.strip() for r in problem_refs_str.split(",") if r.strip()]
             total_problems = len(refs)
-            solved_count = sum(1 for ref in refs if ref in completed_problems)
             
-            # Determine completion: ALL problems must be solved
+            # Count only completions AFTER homework was assigned
+            solved_count = 0
+            problem_solutions = []
+            
+            for ref in refs:
+                if ref in completed_problems:
+                    # Check if any completion is after homework creation
+                    completion_after_hw = False
+                    latest_completion = None
+                    
+                    for ts in completed_problems[ref]:
+                        try:
+                            completion_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            # If no hw_created_datetime, accept any completion
+                            if hw_created_datetime is None or completion_time > hw_created_datetime:
+                                completion_after_hw = True
+                                if latest_completion is None or completion_time > latest_completion:
+                                    latest_completion = completion_time
+                        except:
+                            pass
+                    
+                    if completion_after_hw:
+                        solved_count += 1
+                        problem_solutions.append({"problem_reference": ref, "completed": True})
+                    else:
+                        problem_solutions.append({"problem_reference": ref, "completed": False})
+                else:
+                    problem_solutions.append({"problem_reference": ref, "completed": False})
+            
+            # Determine completion: ALL problems must be solved AFTER homework was assigned
             is_actually_completed = (total_problems > 0 and solved_count >= total_problems)
             
             hw_data = {
@@ -833,7 +874,8 @@ def get_student_homework():
                 "time_limit_minutes": hw.get("time_limit_minutes") or 0,
                 "is_late": False,
                 "solved_count": solved_count,
-                "total_problems": total_problems
+                "total_problems": total_problems,
+                "problem_solutions": problem_solutions
             }
             
             # Check if submission is late (only for completed homework)
@@ -1066,6 +1108,7 @@ def get_student_homework_for_professor():
     Get all homework assigned to a specific student with their progress.
     Query param: email (student's email)
     Used by professor dashboard.
+    FIXED: Only counts completions AFTER homework was assigned.
     """
     email = request.args.get("email", "")
     if not email:
@@ -1084,41 +1127,73 @@ def get_student_homework_for_professor():
             filter_obj={"property": "user_email", "email": {"equals": email}}
         )
         
-        # Build a set of completed problems with scores and times
+        # Build a dict of completed problems with ALL their completions (with timestamps)
         completed_problems = {}
         for act in student_activities:
             if act.get("action") == "completed":
                 ref = act.get("problem_reference") or act.get("problem_name", "")
-                if ref and ref not in completed_problems:
-                    completed_problems[ref] = {
+                timestamp = act.get("timestamp")
+                if ref and timestamp:
+                    if ref not in completed_problems:
+                        completed_problems[ref] = []
+                    completed_problems[ref].append({
                         "score": act.get("score"),
                         "time_spent_seconds": act.get("time_spent_seconds"),
-                        "timestamp": act.get("timestamp")
-                    }
+                        "timestamp": timestamp
+                    })
         
         # Filter homework for this student
         student_homework = []
         for hw in all_homework:
-            assigned_to = hw.get("assigned_to", "")
-            # Check if assigned to all or to this specific student
-            if assigned_to == "all" or email in assigned_to:
+            student_email_field = hw.get("student_email", "")
+            # Check if assigned to this specific student
+            if email == student_email_field or email in str(student_email_field):
                 # Parse problem references
                 refs_str = hw.get("problem_references", "")
                 refs = [r.strip() for r in refs_str.split(",") if r.strip()]
                 
-                # Calculate progress
+                # Get homework creation date
+                hw_created_at = hw.get("created_at") or ""
+                hw_created_datetime = None
+                if hw_created_at:
+                    try:
+                        hw_created_datetime = datetime.fromisoformat(hw_created_at.replace("Z", "+00:00"))
+                    except:
+                        pass
+                
+                # Calculate progress - only count completions AFTER homework was assigned
                 solved_count = 0
                 problem_solutions = []
                 
                 for ref in refs:
                     if ref in completed_problems:
-                        solved_count += 1
-                        problem_solutions.append({
-                            "problem_reference": ref,
-                            "score": completed_problems[ref]["score"],
-                            "time_spent_seconds": completed_problems[ref]["time_spent_seconds"],
-                            "timestamp": completed_problems[ref]["timestamp"]
-                        })
+                        # Find completion AFTER homework was assigned
+                        valid_completion = None
+                        for completion in completed_problems[ref]:
+                            try:
+                                completion_time = datetime.fromisoformat(completion["timestamp"].replace("Z", "+00:00"))
+                                if hw_created_datetime is None or completion_time > hw_created_datetime:
+                                    # This is a valid completion (after homework was assigned)
+                                    if valid_completion is None or completion_time > datetime.fromisoformat(valid_completion["timestamp"].replace("Z", "+00:00")):
+                                        valid_completion = completion
+                            except:
+                                pass
+                        
+                        if valid_completion:
+                            solved_count += 1
+                            problem_solutions.append({
+                                "problem_reference": ref,
+                                "score": valid_completion["score"],
+                                "time_spent_seconds": valid_completion["time_spent_seconds"],
+                                "timestamp": valid_completion["timestamp"]
+                            })
+                        else:
+                            problem_solutions.append({
+                                "problem_reference": ref,
+                                "score": None,
+                                "time_spent_seconds": None,
+                                "timestamp": None
+                            })
                     else:
                         problem_solutions.append({
                             "problem_reference": ref,
@@ -1145,7 +1220,7 @@ def get_student_homework_for_professor():
                 
                 student_homework.append({
                     "id": hw.get("id"),
-                    "title": hw.get("title", "Homework"),
+                    "title": hw.get("Title") or hw.get("title") or hw.get("name") or "Homework",
                     "description": hw.get("description", ""),
                     "due_date": due_date,
                     "points": hw.get("points"),

@@ -394,7 +394,10 @@ def submit_solution():
         
         # --- QUICK WIN 2: Robust evaluation prompt ---
         # Get official solution if available
-        official_solution = problem.get("step_by_step", "")
+        # Architecture: final_answer has the detailed solution/derivation (property)
+        #               Step-by-step is in page BLOCKS (toggles), read by fetch_page_blocks()
+        #               full_solution property may be empty in some problems
+        official_solution = problem.get("final_answer", "") or problem.get("full_solution", "") or problem.get("step_by_step", "")
         
         marks_context = ""
         if marks:

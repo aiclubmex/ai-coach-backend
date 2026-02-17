@@ -1,9 +1,13 @@
-# backend.py - AI Coach Physics Backend v2
+# backend.py - AI Coach Physics Backend v3
 # ==========================================
-# ACTUALIZADO: 16 Feb 2026
-# - Agregado: solution_text en track-activity
-# - Agregado: time_limit_minutes en assign-homework
-# - Agregado: late_submission detection
+# ACTUALIZADO: 17 Feb 2026
+# v3 CHANGES (Quick Wins):
+# - QUICK WIN 1: Marks + expected time calculation
+# - QUICK WIN 2: Robust evaluation prompt with official solution reference,
+#   structured feedback (error_type, missing_steps, key_concept, marks_awarded)
+# - QUICK WIN 3: Attempt tracking (counts previous submissions per user/problem)
+# - New fields in Activity DB: attempt_number, error_type, marks_awarded, marks_total
+# - New Notion field required in Problems DB: marks (Number)
 # ==========================================
 
 import os, re, json, uuid
@@ -311,12 +315,60 @@ def get_steps(problem_id: str):
         return jsonify({"steps": steps})
     except Exception as e: return jsonify({"error": str(e)}), 500
 
+# ========================================
+# HELPER: Count previous attempts for a problem by user
+# ========================================
+def count_previous_attempts(user_email: str, problem_reference: str) -> int:
+    """Count how many times a user has submitted/completed a specific problem."""
+    if not ACTIVITY_DB_ID or not user_email or not problem_reference:
+        return 0
+    try:
+        filter_obj = {
+            "and": [
+                {"property": "user_email", "email": {"equals": user_email}},
+                {"property": "problem_reference", "rich_text": {"equals": problem_reference}},
+                {"property": "action", "select": {"equals": "submitted"}}
+            ]
+        }
+        results = query_database(ACTIVITY_DB_ID, filter_obj)
+        # Also count "completed" actions
+        filter_obj2 = {
+            "and": [
+                {"property": "user_email", "email": {"equals": user_email}},
+                {"property": "problem_reference", "rich_text": {"equals": problem_reference}},
+                {"property": "action", "select": {"equals": "completed"}}
+            ]
+        }
+        results2 = query_database(ACTIVITY_DB_ID, filter_obj2)
+        return len(results) + len(results2)
+    except Exception as e:
+        print(f"[WARNING] Could not count attempts: {e}")
+        return 0
+
+# ========================================
+# HELPER: Calculate expected time from marks
+# ========================================
+def calculate_expected_time(marks, paper_type="P2"):
+    """
+    IB Physics timing rules:
+    - Paper 1: ~1.5 min per mark (but MCQ, not applicable here)
+    - Paper 2: ~1.5 min per mark (95 marks in 135 min)
+    - Paper 3: ~2.0 min per mark (45 marks in 75 min + 10 min reading)
+    """
+    if not marks or marks <= 0:
+        return None
+    if paper_type == "P3":
+        return int(marks * 2.0 * 60)  # seconds
+    else:
+        return int(marks * 1.5 * 60)  # seconds
+
 @app.post("/submit-solution")
 def submit_solution():
     data = request.get_json(force=True, silent=True) or {}
     problem_id = data.get("problem_id")
     solution_text = data.get("solution_text", "")
     time_spent = data.get("time_spent_seconds", 0)
+    user_email = data.get("user_email", "")
     
     if not problem_id or not solution_text:
         return jsonify({"error": "Missing problem_id or solution_text"}), 400
@@ -326,34 +378,88 @@ def submit_solution():
     try:
         problem = fetch_page(problem_id)
         
-        prompt = f"""You are an IB Physics HL examiner. Evaluate this student's solution.
+        # --- QUICK WIN 3: Count previous attempts ---
+        problem_ref = problem.get("problem_reference", "")
+        attempt_number = count_previous_attempts(user_email, problem_ref) + 1
+        
+        # --- QUICK WIN 1: Get marks and expected time ---
+        marks = problem.get("marks", None)
+        # Infer paper type from reference (e.g., 2018-Z1-P2-Q1-A → P2)
+        paper_type = "P2"
+        if problem_ref:
+            parts = problem_ref.split("-")
+            if len(parts) >= 3:
+                paper_type = parts[2]  # "P2" or "P3"
+        expected_time_secs = calculate_expected_time(marks, paper_type)
+        
+        # --- QUICK WIN 2: Robust evaluation prompt ---
+        # Get official solution if available
+        official_solution = problem.get("step_by_step", "")
+        
+        marks_context = ""
+        if marks:
+            marks_context = f"""
+This problem is worth [{marks} marks] in the IB exam.
+Award marks according to IB marking standards:
+- Each mark corresponds to a specific step, concept, or correct value
+- Partial credit is expected: award marks for correct intermediate steps even if final answer is wrong
+- ECF (Error Carried Forward): If a previous step has an error but subsequent steps are correctly applied, award those marks
+"""
+        
+        solution_reference = ""
+        if official_solution:
+            solution_reference = f"""
+OFFICIAL SOLUTION (for reference - do NOT share this with the student):
+{official_solution}
 
-Problem: {problem.get('name', '')}
+Compare the student's work against this reference solution.
+"""
+        
+        attempt_context = ""
+        if attempt_number > 1:
+            attempt_context = f"\nThis is the student's attempt #{attempt_number} at this problem. Be encouraging about improvement while still being precise about errors."
+        
+        prompt = f"""You are an expert IB Physics HL examiner evaluating a student's solution.
+{attempt_context}
+
+PROBLEM DETAILS:
+Name: {problem.get('name', '')}
 Statement: {problem.get('problem_statement', '')}
-Given: {problem.get('given_values', '')}
-Find: {problem.get('find', '')}
+Given values: {problem.get('given_values', '')}
+What to find: {problem.get('find', '')}
+Topic: {problem.get('topic', '')}
+{marks_context}
+{solution_reference}
 
-Student's Solution:
+STUDENT'S SOLUTION:
 {solution_text}
 
-Evaluate the solution and respond with a JSON object:
+TIME SPENT: {time_spent // 60}:{time_spent % 60:02d}
+
+EVALUATE and respond with ONLY a valid JSON object (no markdown, no backticks):
 {{
   "score": <number 0-100>,
   "correct": <true if score >= 70, false otherwise>,
-  "feedback": "<detailed feedback explaining what's correct/incorrect>",
+  "marks_awarded": <number of IB marks earned out of {marks or 'total'}>,
+  "marks_total": {marks or 'null'},
+  "feedback": "<detailed feedback: start with what the student did well, then explain specific errors>",
+  "error_type": "<classify the main error: 'conceptual' | 'calculation' | 'units' | 'method' | 'incomplete' | 'none'>",
+  "missing_steps": "<list any key steps or concepts the student missed>",
+  "key_concept": "<the most important physics concept tested in this problem>",
   "time_taken": "{time_spent // 60}:{time_spent % 60:02d}"
 }}
 """
         
         if not ANTHROPIC_API_KEY:
             return jsonify({
-                "score": 50,
-                "correct": False,
+                "score": 50, "correct": False,
                 "feedback": "Solution submitted but cannot evaluate (API key missing)",
-                "time_taken": f"{time_spent // 60}:{time_spent % 60:02d}"
+                "time_taken": f"{time_spent // 60}:{time_spent % 60:02d}",
+                "attempt_number": attempt_number,
+                "expected_time_seconds": expected_time_secs
             })
         
-        response_text = call_anthropic_api(prompt, max_tokens=1024)
+        response_text = call_anthropic_api(prompt, max_tokens=1500)
         
         clean_response = response_text.strip()
         if clean_response.startswith('```'):
@@ -364,16 +470,33 @@ Evaluate the solution and respond with a JSON object:
         result.setdefault('correct', result.get('score', 0) >= 70)
         result.setdefault('feedback', 'Solution evaluated.')
         result.setdefault('time_taken', f"{time_spent // 60}:{time_spent % 60:02d}")
+        result.setdefault('error_type', 'none')
+        result.setdefault('missing_steps', '')
+        result.setdefault('key_concept', '')
+        result.setdefault('marks_awarded', None)
+        result.setdefault('marks_total', marks)
+        
+        # --- Inject attempt and timing metadata ---
+        result['attempt_number'] = attempt_number
+        result['expected_time_seconds'] = expected_time_secs
+        if expected_time_secs and time_spent:
+            ratio = time_spent / expected_time_secs
+            if ratio <= 1.0:
+                result['time_assessment'] = 'on_pace'
+            elif ratio <= 1.5:
+                result['time_assessment'] = 'slightly_slow'
+            else:
+                result['time_assessment'] = 'too_slow'
         
         return jsonify(result), 200
         
     except Exception as e:
         print(f"[ERROR] Submit solution failed: {e}")
         return jsonify({
-            "score": 50,
-            "correct": False,
+            "score": 50, "correct": False,
             "feedback": f"Error evaluating solution: {str(e)}",
-            "time_taken": f"{time_spent // 60}:{time_spent % 60:02d}"
+            "time_taken": f"{time_spent // 60}:{time_spent % 60:02d}",
+            "attempt_number": 1, "expected_time_seconds": None
         }), 200
 
 @app.post("/chat")
@@ -468,6 +591,24 @@ def track_activity():
         # Notion rich_text has a 2000 character limit per block
         solution = data.get("solution_text", "")[:2000]
         properties["solution_text"] = {"rich_text": [{"text": {"content": solution}}]}
+    
+    # ========================================
+    # QUICK WIN 3: Save attempt_number for tracking
+    # ========================================
+    if data.get("attempt_number") is not None:
+        properties["attempt_number"] = {"number": data.get("attempt_number", 1)}
+    
+    # ========================================
+    # QUICK WIN 2: Save error_type and marks for analytics
+    # ========================================
+    if data.get("error_type"):
+        properties["error_type"] = {"rich_text": [{"text": {"content": data.get("error_type", "")[:200]}}]}
+    
+    if data.get("marks_awarded") is not None:
+        properties["marks_awarded"] = {"number": data.get("marks_awarded", 0)}
+    
+    if data.get("marks_total") is not None:
+        properties["marks_total"] = {"number": data.get("marks_total", 0)}
     
     try:
         create_page_in_database(ACTIVITY_DB_ID, properties)

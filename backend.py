@@ -724,7 +724,8 @@ def user_stats():
                     "problem_name": display_name,
                     "score": activity.get("score", 0) or 0,
                     "timestamp": activity.get("timestamp", ""),
-                    "action": activity.get("action", "")
+                    "action": activity.get("action", ""),
+                    "professor_feedback": activity.get("professor_feedback", "")
                 })
         
         return jsonify({
@@ -850,6 +851,7 @@ def all_users():
             for activity in user_activities[:10]:
                 display_name = activity.get("problem_reference") or activity.get("problem_name", "Unknown")
                 recent_activities.append({
+                    "id": activity.get("id", ""),
                     "problem_name": display_name,
                     "action": activity.get("action", "opened"),
                     "score": activity.get("score", 0) or 0,
@@ -859,7 +861,8 @@ def all_users():
                     "error_type": activity.get("error_type", ""),
                     "marks_awarded": activity.get("marks_awarded"),
                     "marks_total": activity.get("marks_total"),
-                    "attempt_number": activity.get("attempt_number")
+                    "attempt_number": activity.get("attempt_number"),
+                    "professor_feedback": activity.get("professor_feedback", "")
                 })
             
             # Aggregate error patterns for this student
@@ -1033,6 +1036,59 @@ def error_patterns():
         
     except Exception as e:
         print(f"[ERROR] Error patterns failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ============================================================================
+# PROFESSOR FEEDBACK ON STUDENT ATTEMPTS
+# ============================================================================
+
+@app.post("/api/professor/feedback")
+def save_professor_feedback():
+    """
+    Save professor's feedback comment on a specific student activity.
+    Expects: { activity_id, feedback }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    activity_id = data.get("activity_id", "").strip()
+    feedback = data.get("feedback", "").strip()
+    
+    if not activity_id:
+        return jsonify({"error": "Missing activity_id"}), 400
+    if not feedback:
+        return jsonify({"error": "Missing feedback"}), 400
+    
+    try:
+        update_page_properties(activity_id, {
+            "professor_feedback": {"rich_text": [{"text": {"content": feedback[:2000]}}]}
+        })
+        print(f"[FEEDBACK] Saved feedback for activity {activity_id}: {feedback[:50]}...")
+        return jsonify({"ok": True, "message": "Feedback saved"}), 200
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[ERROR] Save feedback failed: {error_msg}")
+        # If property doesn't exist in Notion, give helpful error
+        if "professor_feedback" in error_msg or "validation" in error_msg.lower():
+            return jsonify({"error": "Please add a 'professor_feedback' Rich Text property to your Activity database in Notion first."}), 400
+        return jsonify({"error": error_msg}), 500
+
+@app.get("/api/professor/feedback/<activity_id>")
+def get_professor_feedback(activity_id):
+    """Get feedback for a specific activity."""
+    try:
+        pid = sanitize_uuid(activity_id)
+        if not pid:
+            return jsonify({"error": "Invalid ID"}), 400
+        url = f"{NOTION_BASE}/pages/{pid}"
+        resp = requests.get(url, headers=NOTION_HEADERS, timeout=10)
+        resp.raise_for_status()
+        props = resp.json().get("properties", {})
+        fb = props.get("professor_feedback", {})
+        fb_text = ""
+        if fb.get("type") == "rich_text":
+            arr = fb.get("rich_text", [])
+            fb_text = arr[0].get("plain_text", "") if arr else ""
+        return jsonify({"feedback": fb_text}), 200
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ============================================================================

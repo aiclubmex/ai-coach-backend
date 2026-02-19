@@ -43,6 +43,7 @@ JWT_SECRET_KEY      = os.environ.get("JWT_SECRET_KEY", "change-this-secret-key-i
 # Flask
 # ==============================
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max for image uploads
 CORS(app, resources={
     r"/*": {
         "origins": ["https://aiclub.com.mx", "http://aiclub.com.mx"],
@@ -264,6 +265,28 @@ def call_anthropic_api(prompt: str, max_tokens: int = 1024) -> str:
     resp.raise_for_status()
     return resp.json().get("content", [])[0].get("text", "")
 
+def call_anthropic_vision(prompt: str, image_base64: str, media_type: str = "image/jpeg", max_tokens: int = 1500) -> str:
+    """Call Claude API with an image (vision) for evaluating handwritten solutions."""
+    if not ANTHROPIC_API_KEY: raise ValueError("ANTHROPIC_API_KEY not configured")
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_base64}},
+        {"type": "text", "text": prompt}
+    ]
+    
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "system": "You are a helpful IB Physics tutor. You can read handwritten solutions from photos. Always respond with valid JSON only.",
+        "messages": [{"role": "user", "content": content}]
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=90)
+    resp.raise_for_status()
+    return resp.json().get("content", [])[0].get("text", "")
+
 def generate_steps_with_llm(problem: Dict[str, Any]) -> List[Dict[str, str]]:
     title = problem.get("title") or problem.get("name", "")
     prompt = f"Create a clear 4-6 step solution plan for this problem: {title}\nStatement: {problem.get('statement', '')}\nFormat: Numbered lines only."
@@ -369,11 +392,15 @@ def submit_solution():
     solution_text = data.get("solution_text", "")
     time_spent = data.get("time_spent_seconds", 0)
     user_email = data.get("user_email", "")
+    image_base64 = data.get("image_base64", "")
+    image_media_type = data.get("image_media_type", "image/jpeg")
     
-    if not problem_id or not solution_text:
-        return jsonify({"error": "Missing problem_id or solution_text"}), 400
+    has_image = bool(image_base64)
     
-    print(f"[SUBMIT] Evaluating solution for problem: {problem_id}")
+    if not problem_id or (not solution_text and not has_image):
+        return jsonify({"error": "Missing problem_id or solution"}), 400
+    
+    print(f"[SUBMIT] Evaluating solution for problem: {problem_id} | Image: {has_image}")
     
     try:
         problem = fetch_page(problem_id)
@@ -394,10 +421,10 @@ def submit_solution():
         
         # --- QUICK WIN 2: Robust evaluation prompt ---
         # Get official solution if available
-        # Architecture: final_answer has the detailed solution/derivation (property)
-        #               Step-by-step is in page BLOCKS (toggles), read by fetch_page_blocks()
-        #               full_solution property may be empty in some problems
-        official_solution = problem.get("final_answer", "") or problem.get("full_solution", "") or problem.get("step_by_step", "")
+        # Standard: full_solution = detailed step-by-step (for evaluation reference)
+        #           final_answer = short answer with units (for quick display)
+        #           Fallback chain for backward compatibility with existing problems
+        official_solution = problem.get("full_solution", "") or problem.get("final_answer", "") or problem.get("step_by_step", "")
         
         marks_context = ""
         if marks:
@@ -436,6 +463,7 @@ Topic: {problem.get('topic', '')}
 
 STUDENT'S SOLUTION:
 {solution_text}
+{"" if not has_image else "The student has also attached a PHOTO of their handwritten solution. Read and evaluate the handwritten work in the image carefully. The image contains their actual work — evaluate what you see in the photo."}
 
 TIME SPENT: {time_spent // 60}:{time_spent % 60:02d}
 
@@ -462,7 +490,11 @@ EVALUATE and respond with ONLY a valid JSON object (no markdown, no backticks):
                 "expected_time_seconds": expected_time_secs
             })
         
-        response_text = call_anthropic_api(prompt, max_tokens=1500)
+        # Use vision API if image is attached, otherwise text-only
+        if has_image:
+            response_text = call_anthropic_vision(prompt, image_base64, image_media_type, max_tokens=1500)
+        else:
+            response_text = call_anthropic_api(prompt, max_tokens=1500)
         
         clean_response = response_text.strip()
         if clean_response.startswith('```'):

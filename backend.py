@@ -1423,7 +1423,7 @@ def practice_recommendations():
         all_problems = query_database(NOTION_DB_ID, max_pages=5)
         
         # 3. Analyze student data
-        solved_well = set()  # problems scored >= 70
+        solved_well = set()  # problems scored >= 85 (truly mastered)
         solved_any = set()   # all attempted problems
         topic_scores = {}    # topic → [scores]
         error_patterns = {}  # (topic, error_type) → count
@@ -1440,7 +1440,7 @@ def practice_recommendations():
             key_concept = (act.get("key_concept") or "").strip()
             
             solved_any.add(problem_ref)
-            if score >= 70:
+            if score >= 85:
                 solved_well.add(problem_ref)
             
             # Find topic for this problem
@@ -1471,8 +1471,8 @@ def practice_recommendations():
                     key = f"{topic}|{error_type}"
                     error_patterns[key] = error_patterns.get(key, 0) + 1
             
-            # Track weak concepts
-            if key_concept and score < 70:
+            # Track weak concepts (broadened: any score below 85 OR any error)
+            if key_concept and (score < 85 or (error_type and error_type != "none")):
                 if key_concept not in weak_concepts:
                     weak_concepts[key_concept] = {"count": 0, "total_score": 0, "error_types": {}}
                 weak_concepts[key_concept]["count"] += 1
@@ -1511,7 +1511,14 @@ def practice_recommendations():
         
         # 5. Generate TOPIC PRACTICE recommendations
         topic_practice = []
-        for topic in recent_topics:
+        
+        # Include ALL topics that have available problems (not just recent)
+        all_topic_names = set(list(topic_scores.keys()) + list(problems_by_topic.keys()))
+        
+        for topic in all_topic_names:
+            if topic == "Other" or not topic:
+                continue
+            
             scores = topic_scores.get(topic, [])
             avg_score = round(sum(scores) / len(scores), 1) if scores else 0
             
@@ -1519,17 +1526,28 @@ def practice_recommendations():
             available = [p for p in problems_by_topic.get(topic, []) if not p["already_solved"]]
             
             if available:
+                # Determine status
+                if not scores:
+                    status = "not_started"
+                elif avg_score >= 85:
+                    status = "strong"
+                elif avg_score >= 65:
+                    status = "developing"
+                else:
+                    status = "needs_work"
+                
                 topic_practice.append({
                     "topic": topic,
                     "avg_score": avg_score,
                     "problems_solved": len(scores),
                     "problems_available": len(available),
-                    "status": "strong" if avg_score >= 80 else "developing" if avg_score >= 60 else "needs_work",
+                    "status": status,
                     "recommended_problems": available[:5]  # top 5 unsolved
                 })
         
-        # Sort: weakest topics first
-        topic_practice.sort(key=lambda x: x["avg_score"])
+        # Sort: needs_work first, then developing, not_started, strong
+        status_order = {"needs_work": 0, "developing": 1, "not_started": 2, "strong": 3}
+        topic_practice.sort(key=lambda x: (status_order.get(x["status"], 4), x["avg_score"]))
         
         # 6. Generate WEAKNESS REINFORCEMENT recommendations
         weakness_reinforcement = []

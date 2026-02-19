@@ -271,8 +271,19 @@ def call_anthropic_vision(prompt: str, image_base64: str, media_type: str = "ima
     url = "https://api.anthropic.com/v1/messages"
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     
+    # Clean base64 data - remove any whitespace/newlines and data URL prefix if present
+    clean_b64 = image_base64.strip()
+    if clean_b64.startswith('data:'):
+        clean_b64 = clean_b64.split(',', 1)[1] if ',' in clean_b64 else clean_b64
+    clean_b64 = clean_b64.replace('\n', '').replace('\r', '').replace(' ', '')
+    
+    # Validate media type
+    valid_types = ['image/jpeg', 'image/png', 'image/gif', 'image/webp']
+    if media_type not in valid_types:
+        media_type = 'image/jpeg'
+    
     content = [
-        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_base64}},
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": clean_b64}},
         {"type": "text", "text": prompt}
     ]
     
@@ -283,8 +294,15 @@ def call_anthropic_vision(prompt: str, image_base64: str, media_type: str = "ima
         "system": "You are a helpful IB Physics tutor. You can read handwritten solutions from photos. Always respond with valid JSON only.",
         "messages": [{"role": "user", "content": content}]
     }
+    
+    print(f"[VISION] Sending image ({media_type}, ~{len(clean_b64)//1024}KB base64) to Claude API...")
     resp = requests.post(url, headers=headers, json=payload, timeout=90)
-    resp.raise_for_status()
+    
+    if not resp.ok:
+        error_body = resp.text
+        print(f"[VISION ERROR] Status: {resp.status_code}, Body: {error_body[:500]}")
+        resp.raise_for_status()
+    
     return resp.json().get("content", [])[0].get("text", "")
 
 def generate_steps_with_llm(problem: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -400,7 +418,7 @@ def submit_solution():
     if not problem_id or (not solution_text and not has_image):
         return jsonify({"error": "Missing problem_id or solution"}), 400
     
-    print(f"[SUBMIT] Evaluating solution for problem: {problem_id} | Image: {has_image}")
+    print(f"[SUBMIT] Evaluating solution for problem: {problem_id} | Image: {has_image}" + (f" | Image size: ~{len(image_base64)//1024}KB" if has_image else ""))
     
     try:
         problem = fetch_page(problem_id)
@@ -526,10 +544,19 @@ EVALUATE and respond with ONLY a valid JSON object (no markdown, no backticks):
         return jsonify(result), 200
         
     except Exception as e:
-        print(f"[ERROR] Submit solution failed: {e}")
+        error_detail = str(e)
+        # Try to get actual API error message
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                err_json = e.response.json()
+                error_detail = err_json.get('error', {}).get('message', str(e))
+                print(f"[ERROR] Anthropic API error: {err_json}")
+            except:
+                error_detail = e.response.text[:300] if e.response.text else str(e)
+        print(f"[ERROR] Submit solution failed: {error_detail}")
         return jsonify({
             "score": 50, "correct": False,
-            "feedback": f"Error evaluating solution: {str(e)}",
+            "feedback": f"Error evaluating solution: {error_detail}",
             "time_taken": f"{time_spent // 60}:{time_spent % 60:02d}",
             "attempt_number": 1, "expected_time_seconds": None
         }), 200

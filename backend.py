@@ -17,6 +17,7 @@ from flask_cors import CORS
 import requests
 from functools import wraps
 from datetime import datetime, timedelta, timezone
+import time
 
 try:
     import bcrypt
@@ -52,6 +53,32 @@ CORS(app, resources={
         "supports_credentials": False
     }
 })
+
+# ==============================
+# Simple in-memory cache (avoids hammering Notion on repeated loads)
+# ==============================
+_cache = {}
+CACHE_TTL = 60  # seconds
+
+def cache_get(key):
+    """Get cached value if not expired."""
+    entry = _cache.get(key)
+    if entry and time.time() - entry["time"] < CACHE_TTL:
+        return entry["data"]
+    return None
+
+def cache_set(key, data):
+    """Cache data with TTL."""
+    _cache[key] = {"data": data, "time": time.time()}
+
+def cache_clear(prefix=""):
+    """Clear cache entries matching prefix."""
+    if not prefix:
+        _cache.clear()
+    else:
+        keys_to_remove = [k for k in _cache if k.startswith(prefix)]
+        for k in keys_to_remove:
+            del _cache[k]
 
 # ==============================
 # Notion helpers
@@ -113,7 +140,8 @@ def fetch_page(page_id: str) -> Dict[str, Any]:
     
     return out
 
-def query_database(database_id: str, filter_obj: dict = None, sorts: list = None) -> List[Dict[str, Any]]:
+def query_database(database_id: str, filter_obj: dict = None, sorts: list = None, max_pages: int = 0) -> List[Dict[str, Any]]:
+    """Query a Notion database. max_pages=0 means unlimited (fetch all)."""
     if database_id in [USERS_DB_ID, ACTIVITY_DB_ID, HOMEWORK_DB_ID]:
         db_id = database_id
     else:
@@ -124,6 +152,7 @@ def query_database(database_id: str, filter_obj: dict = None, sorts: list = None
     all_pages = []
     has_more = True
     start_cursor = None
+    pages_fetched = 0
     
     while has_more:
         payload = {}
@@ -138,6 +167,13 @@ def query_database(database_id: str, filter_obj: dict = None, sorts: list = None
         all_pages.extend(data.get("results", []))
         has_more = data.get("has_more", False)
         start_cursor = data.get("next_cursor")
+        pages_fetched += 1
+        
+        # Limit pagination if max_pages is set
+        if max_pages > 0 and pages_fetched >= max_pages:
+            if has_more:
+                print(f"[QUERY] Stopped after {pages_fetched} pages ({len(all_pages)} results). More data exists.")
+            break
     
     results = []
     for page in all_pages:
@@ -675,6 +711,7 @@ def track_activity():
     
     try:
         create_page_in_database(ACTIVITY_DB_ID, properties)
+        cache_clear()  # Invalidate all caches when new data comes in
         return jsonify({"success": True})
     except Exception as e: 
         print(f"[ERROR] Track activity failed: {e}")
@@ -799,14 +836,24 @@ def user_progress():
 def all_users():
     """
     Get all users with their progress and solution texts.
-    UPDATED: Now includes solution_text in recent_activities.
+    OPTIMIZED: Cached for 60s, sorted by timestamp desc, max 1000 activities.
     """
     if not USERS_DB_ID or not ACTIVITY_DB_ID:
         return jsonify({"error": "Databases not configured"}), 500
     
+    # Check cache first
+    cached = cache_get("all-users")
+    if cached:
+        print("[CACHE HIT] all-users")
+        return jsonify(cached), 200
+    
     try:
         users = query_database(USERS_DB_ID)
-        all_activities = query_database(ACTIVITY_DB_ID)
+        all_activities = query_database(
+            ACTIVITY_DB_ID,
+            sorts=[{"property": "timestamp", "direction": "descending"}],
+            max_pages=10  # max ~1000 activities, recent first
+        )
         
         user_stats_list = []
         
@@ -904,13 +951,16 @@ def all_users():
         users_with_scores = [u for u in user_stats_list if u["avg_score"] > 0]
         avg_score = round(sum(u["avg_score"] for u in users_with_scores) / len(users_with_scores), 1) if users_with_scores else 0
         
-        return jsonify({
+        result = {
             "total_students": total_students,
             "active_today": active_today,
             "problems_solved": problems_solved,
             "avg_score": avg_score,
             "students": user_stats_list
-        }), 200
+        }
+        cache_set("all-users", result)
+        print(f"[ALL-USERS] Returned {total_students} students, {len(all_activities)} activities processed")
+        return jsonify(result), 200
         
     except Exception as e:
         print(f"[ERROR] Failed to get all users: {e}")
@@ -932,7 +982,17 @@ def error_patterns():
         return jsonify({"error": "ACTIVITY_DB_ID not configured"}), 500
     
     try:
-        all_activities = query_database(ACTIVITY_DB_ID)
+        # Check cache first
+        cached = cache_get("error-patterns")
+        if cached:
+            print("[CACHE HIT] error-patterns")
+            return jsonify(cached), 200
+        
+        all_activities = query_database(
+            ACTIVITY_DB_ID,
+            sorts=[{"property": "timestamp", "direction": "descending"}],
+            max_pages=10  # max ~1000 activities
+        )
         
         # Global error distribution
         global_errors = {}
@@ -1024,7 +1084,7 @@ def error_patterns():
                     "text": f"Student needing most support: {struggling} ({student_totals[struggling]} total errors)"
                 })
         
-        return jsonify({
+        result = {
             "global_distribution": global_errors,
             "avg_score_by_error": avg_by_error,
             "student_errors": student_errors,
@@ -1032,7 +1092,9 @@ def error_patterns():
             "recent_errors": error_timeline[:30],
             "insights": insights,
             "total_errors": total_errors if total_errors else 0
-        }), 200
+        }
+        cache_set("error-patterns", result)
+        return jsonify(result), 200
         
     except Exception as e:
         print(f"[ERROR] Error patterns failed: {e}")
@@ -1062,6 +1124,7 @@ def save_professor_feedback():
             "professor_feedback": {"rich_text": [{"text": {"content": feedback[:2000]}}]}
         })
         print(f"[FEEDBACK] Saved feedback for activity {activity_id}: {feedback[:50]}...")
+        cache_clear()  # Invalidate caches
         return jsonify({"ok": True, "message": "Feedback saved"}), 200
     except Exception as e:
         error_msg = str(e)

@@ -1648,6 +1648,331 @@ def get_weakness_description(topic, error_type, count):
     return error_descriptions.get(error_type, f"You've had {error_type} errors in {topic} {count} time(s). Review this topic carefully.")
 
 # ============================================================================
+# AI PROBLEM GENERATION ENGINE
+# ============================================================================
+
+@app.post("/api/generate-problem")
+@require_auth
+def generate_problem():
+    """
+    Generate a new problem variant using AI.
+    
+    Input JSON:
+    - topic (required): e.g. "Magnetism", "Optics"
+    - marks (optional): target marks, default 4
+    - error_type (optional): weakness to target, e.g. "calculation"
+    - template_id (optional): specific problem to use as template
+    
+    Returns a generated problem ready for the chatbot to display.
+    """
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"error": "API key not configured"}), 500
+    
+    data = request.get_json(force=True, silent=True) or {}
+    topic = (data.get("topic") or "").strip()
+    target_marks = data.get("marks", 4)
+    error_type = (data.get("error_type") or "").strip()
+    template_id = (data.get("template_id") or "").strip()
+    
+    if not topic:
+        return jsonify({"error": "topic is required"}), 400
+    
+    try:
+        # 1. Find template problem(s) from the same topic
+        template_problem = None
+        template_examples = []
+        
+        if template_id:
+            # Use specific template
+            try:
+                template_problem = fetch_page(template_id)
+            except:
+                pass
+        
+        if not template_problem and NOTION_DB_ID:
+            # Find problems in the same topic
+            all_problems = query_database(NOTION_DB_ID, max_pages=5)
+            topic_problems = []
+            for p in all_problems:
+                kc = p.get("key_concepts") or p.get("Key Concepts") or ""
+                if isinstance(kc, list):
+                    kc = kc[0] if kc else ""
+                p_topic = kc.split(";")[0].strip().lower() if kc else ""
+                if topic.lower() in p_topic or p_topic in topic.lower():
+                    topic_problems.append(p)
+            
+            if topic_problems:
+                # Pick up to 2 as examples for style reference
+                import random
+                samples = random.sample(topic_problems, min(2, len(topic_problems)))
+                for s in samples:
+                    pid = s.get("id", "")
+                    try:
+                        full = fetch_page(pid)
+                        template_examples.append(full)
+                    except:
+                        template_examples.append(s)
+                template_problem = template_examples[0] if template_examples else None
+        
+        # 2. Build generation prompt
+        examples_text = ""
+        if template_examples:
+            for i, ex in enumerate(template_examples):
+                examples_text += f"""
+--- EXAMPLE PROBLEM {i+1} ---
+Name: {ex.get('name') or ex.get('Name', '')}
+Statement: {ex.get('problem_statement', '') or ex.get('statement', '')}
+Given values: {ex.get('given_values', '')}
+What to find: {ex.get('find', '')}
+Marks: {ex.get('marks') or ex.get('Marks', target_marks)}
+Solution: {ex.get('full_solution', '') or ex.get('step_by_step', '')}
+"""
+        elif template_problem:
+            examples_text = f"""
+--- TEMPLATE PROBLEM ---
+Name: {template_problem.get('name') or template_problem.get('Name', '')}
+Statement: {template_problem.get('problem_statement', '') or template_problem.get('statement', '')}
+Given values: {template_problem.get('given_values', '')}
+What to find: {template_problem.get('find', '')}
+Marks: {template_problem.get('marks') or template_problem.get('Marks', target_marks)}
+Solution: {template_problem.get('full_solution', '') or template_problem.get('step_by_step', '')}
+"""
+        
+        weakness_context = ""
+        if error_type:
+            weakness_context = f"""
+IMPORTANT: This problem should specifically test areas where students commonly make {error_type} errors.
+- If error_type is "calculation": include multi-step calculations with unit conversions
+- If error_type is "conceptual": test understanding of when/why to apply specific formulas
+- If error_type is "units": require careful unit tracking (SI conversions, prefixes)
+- If error_type is "method": require choosing between similar approaches
+- If error_type is "incomplete": require showing ALL steps for full marks
+"""
+        
+        prompt = f"""You are an expert IB Physics HL examiner. Generate a NEW, ORIGINAL problem for the topic "{topic}" worth [{target_marks} marks].
+
+REQUIREMENTS:
+1. The problem must be at IB Physics HL standard (difficulty and style)
+2. It must be DIFFERENT from the examples below but test similar concepts
+3. Include realistic numerical values with proper units
+4. The problem should be solvable in approximately {int(target_marks * 1.5)} minutes
+5. Provide a complete step-by-step solution with mark allocation
+{weakness_context}
+
+{examples_text if examples_text else f"Generate an IB-style problem on {topic} worth {target_marks} marks."}
+
+Respond with ONLY a valid JSON object (no markdown, no backticks):
+{{
+  "name": "<short descriptive name, e.g. 'Magnetic Force on Moving Charge'>",
+  "problem_statement": "<the complete problem text as it would appear on an IB exam>",
+  "given_values": "<list the given numerical values>",
+  "find": "<what the student needs to calculate/determine>",
+  "marks": {target_marks},
+  "key_concept": "{topic}",
+  "steps": [
+    {{
+      "id": "1",
+      "title": "<step title, e.g. 'Identify the formula'>",
+      "content": "<what the student should do>",
+      "expected_answer": "<the correct result for this step>",
+      "marks": <marks for this step>
+    }}
+  ],
+  "final_answer": "<the complete final answer with units>",
+  "full_solution": "<complete worked solution as one text block>"
+}}
+"""
+        
+        # 3. Call Claude API
+        response_text = call_anthropic(prompt, max_tokens=2000)
+        
+        # 4. Parse response
+        import re
+        cleaned = response_text.strip()
+        # Remove markdown code fences if present
+        cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+        cleaned = re.sub(r'\s*```$', '', cleaned)
+        
+        generated = json.loads(cleaned)
+        
+        # Add metadata
+        generated["source"] = "ai_generated"
+        generated["topic"] = topic
+        generated["template_reference"] = template_problem.get("problem_reference", "") if template_problem else ""
+        generated["generated_at"] = datetime.utcnow().isoformat()
+        
+        # Generate a temporary ID for tracking
+        import hashlib
+        temp_id = "gen_" + hashlib.md5(
+            f"{topic}_{target_marks}_{datetime.utcnow().isoformat()}".encode()
+        ).hexdigest()[:12]
+        generated["id"] = temp_id
+        generated["problem_reference"] = f"AI-{topic[:3].upper()}-{target_marks}m-{temp_id[-6:]}"
+        
+        print(f"[GENERATE] Created problem: {generated['problem_reference']} | Topic: {topic} | Marks: {target_marks}")
+        
+        return jsonify(generated), 200
+        
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Failed to parse generated problem: {e}")
+        print(f"[ERROR] Raw response: {response_text[:500]}")
+        return jsonify({"error": "Failed to parse generated problem. Please try again."}), 500
+    except Exception as e:
+        print(f"[ERROR] Problem generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/evaluate-generated")
+@require_auth
+def evaluate_generated():
+    """
+    Evaluate a student's solution to an AI-generated problem.
+    Similar to /submit but works with in-memory problem data.
+    Saves result to Activity with source='ai_generated'.
+    """
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"error": "API key not configured"}), 500
+    
+    user = request.user
+    user_email = user.get("email", "")
+    
+    data = request.get_json(force=True, silent=True) or {}
+    
+    # Problem details (from generate-problem response)
+    problem_name = data.get("problem_name", "")
+    problem_statement = data.get("problem_statement", "")
+    problem_reference = data.get("problem_reference", "")
+    full_solution = data.get("full_solution", "")
+    marks = data.get("marks", 4)
+    key_concept = data.get("key_concept", "")
+    topic = data.get("topic", "")
+    
+    # Student solution
+    solution_text = (data.get("solution") or "").strip()
+    time_spent = int(data.get("time_spent", 0) or 0)
+    
+    # Image support
+    image_base64 = data.get("image_base64", "")
+    image_media_type = data.get("image_media_type", "image/jpeg")
+    has_image = bool(image_base64)
+    
+    if not solution_text and not has_image:
+        return jsonify({"error": "No solution provided"}), 400
+    
+    try:
+        marks_context = ""
+        if marks:
+            marks_context = f"""
+This problem is worth [{marks} marks] in the IB exam.
+Award marks according to IB marking standards:
+- Each mark corresponds to a specific step, concept, or correct value
+- Partial credit is expected
+- ECF (Error Carried Forward) applies
+"""
+        
+        solution_reference = ""
+        if full_solution:
+            solution_reference = f"""
+OFFICIAL SOLUTION (for reference - do NOT share with student):
+{full_solution}
+
+Compare the student's work against this reference.
+"""
+        
+        prompt = f"""You are an expert IB Physics HL examiner evaluating a student's solution.
+
+PROBLEM DETAILS:
+Name: {problem_name}
+Statement: {problem_statement}
+Topic: {topic}
+{marks_context}
+{solution_reference}
+
+STUDENT'S SOLUTION:
+{solution_text}
+{"The student has attached a PHOTO of their handwritten solution. Evaluate the handwritten work carefully." if has_image else ""}
+
+TIME SPENT: {time_spent // 60}:{time_spent % 60:02d}
+
+EVALUATE and respond with ONLY a valid JSON object (no markdown, no backticks):
+{{
+  "score": <number 0-100>,
+  "correct": <true if score >= 70, false otherwise>,
+  "marks_awarded": <number of IB marks earned out of {marks}>,
+  "marks_total": {marks},
+  "feedback": "<detailed feedback>",
+  "error_type": "<classify: 'conceptual' | 'calculation' | 'units' | 'method' | 'incomplete' | 'none'>",
+  "missing_steps": "<key steps missed>",
+  "key_concept": "{key_concept}",
+  "time_taken": "{time_spent // 60}:{time_spent % 60:02d}"
+}}
+"""
+        
+        if has_image:
+            response_text = call_anthropic_vision(prompt, image_base64, image_media_type, max_tokens=1500)
+        else:
+            response_text = call_anthropic(prompt, max_tokens=1500)
+        
+        # Parse result
+        import re
+        cleaned = response_text.strip()
+        cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+        cleaned = re.sub(r'\s*```$', '', cleaned)
+        result = json.loads(cleaned)
+        result.setdefault('error_type', 'none')
+        result.setdefault('marks_awarded', 0)
+        result.setdefault('marks_total', marks)
+        
+        # Save to Activity DB with ai_generated marker
+        if ACTIVITY_DB_ID:
+            try:
+                properties = {
+                    "user_email": {"email": user_email},
+                    "action": {"select": {"name": "completed"}},
+                    "problem_name": {"title": [{"text": {"content": f"[AI] {problem_name}"[:100]}}]},
+                    "problem_reference": {"rich_text": [{"text": {"content": problem_reference[:100]}}]},
+                    "score": {"number": result.get("score", 0)},
+                    "time_spent_seconds": {"number": time_spent},
+                    "solution_text": {"rich_text": [{"text": {"content": (solution_text or "")[:2000]}}]},
+                    "timestamp": {"date": {"start": datetime.utcnow().isoformat() + "Z"}}
+                }
+                
+                # Add structured fields
+                if result.get("error_type"):
+                    properties["error_type"] = {"rich_text": [{"text": {"content": result["error_type"][:200]}}]}
+                if result.get("marks_awarded") is not None:
+                    properties["marks_awarded"] = {"number": result["marks_awarded"]}
+                if result.get("marks_total") is not None:
+                    properties["marks_total"] = {"number": result["marks_total"]}
+                if result.get("key_concept"):
+                    properties["key_concept"] = {"rich_text": [{"text": {"content": result["key_concept"][:200]}}]}
+                
+                requests.post(
+                    f"{NOTION_BASE}/pages",
+                    headers=NOTION_HEADERS,
+                    json={"parent": {"database_id": ACTIVITY_DB_ID}, "properties": properties},
+                    timeout=10
+                )
+                print(f"[EVAL-GEN] Saved activity for {user_email}: {problem_reference} = {result.get('score', 0)}%")
+            except Exception as e:
+                print(f"[WARN] Could not save generated problem activity: {e}")
+        
+        result["source"] = "ai_generated"
+        result["problem_reference"] = problem_reference
+        
+        return jsonify(result), 200
+        
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Failed to parse evaluation: {e}")
+        return jsonify({"score": 50, "correct": False, "feedback": "Could not parse evaluation. Please try again.", "error_type": "none"}), 200
+    except Exception as e:
+        print(f"[ERROR] Generated problem evaluation failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================================
 # HOMEWORK SYSTEM - UPDATED WITH time_limit_minutes
 # ============================================================================
 

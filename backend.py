@@ -1101,6 +1101,208 @@ def error_patterns():
         return jsonify({"error": str(e)}), 500
 
 # ============================================================================
+# PROFESSOR ANALYTICS
+# ============================================================================
+
+@app.get("/api/professor/analytics")
+def professor_analytics():
+    """
+    Comprehensive analytics for professor dashboard.
+    Returns: score trends, topic performance, student rankings, time analysis.
+    Cross-references activities with problems DB for topic data.
+    """
+    if not ACTIVITY_DB_ID:
+        return jsonify({"error": "ACTIVITY_DB_ID not configured"}), 500
+    
+    cached = cache_get("analytics")
+    if cached:
+        print("[CACHE HIT] analytics")
+        return jsonify(cached), 200
+    
+    try:
+        all_activities = query_database(
+            ACTIVITY_DB_ID,
+            sorts=[{"property": "timestamp", "direction": "descending"}],
+            max_pages=10
+        )
+        
+        # Build topic lookup from problems DB
+        topic_map = {}
+        if NOTION_DB_ID:
+            try:
+                problems = query_database(NOTION_DB_ID, max_pages=5)
+                for p in problems:
+                    pname = p.get("Name") or p.get("name") or p.get("title") or ""
+                    pref = p.get("reference") or p.get("Reference") or ""
+                    # Extract first topic from key_concepts
+                    kc = p.get("key_concepts") or p.get("Key Concepts") or ""
+                    if isinstance(kc, list):
+                        kc = kc[0] if kc else ""
+                    topic = kc.split(";")[0].strip() if kc else "Other"
+                    if pname:
+                        topic_map[pname] = topic
+                    if pref:
+                        topic_map[pref] = topic
+                print(f"[ANALYTICS] Built topic map with {len(topic_map)} entries")
+            except Exception as e:
+                print(f"[ANALYTICS] Could not build topic map: {e}")
+        
+        # ---- Aggregate data ----
+        # Score trends by date
+        daily_scores = {}
+        # Topic performance
+        topic_stats = {}
+        # Student rankings
+        student_data = {}
+        # Time analysis
+        time_by_day = {}
+        # Marks analysis
+        marks_data = []
+        
+        for act in all_activities:
+            if act.get("action") != "completed":
+                continue
+            
+            email = act.get("user_email", "")
+            score = act.get("score", 0) or 0
+            timestamp = act.get("timestamp", "")
+            time_spent = act.get("time_spent_seconds", 0) or 0
+            problem = act.get("problem_reference") or act.get("problem_name", "")
+            marks_aw = act.get("marks_awarded")
+            marks_tot = act.get("marks_total")
+            error_type = (act.get("error_type") or "").strip().lower()
+            
+            # Date key (YYYY-MM-DD)
+            date_key = timestamp[:10] if timestamp else "unknown"
+            
+            # Topic lookup
+            topic = topic_map.get(problem, "")
+            if not topic:
+                # Try matching by problem_name
+                pname = act.get("problem_name", "")
+                topic = topic_map.get(pname, "Other")
+            
+            # --- Daily scores ---
+            if date_key != "unknown":
+                if date_key not in daily_scores:
+                    daily_scores[date_key] = {"total": 0, "count": 0}
+                daily_scores[date_key]["total"] += score
+                daily_scores[date_key]["count"] += 1
+            
+            # --- Topic stats ---
+            if topic:
+                if topic not in topic_stats:
+                    topic_stats[topic] = {"total_score": 0, "count": 0, "errors": {}, "marks_earned": 0, "marks_possible": 0}
+                topic_stats[topic]["total_score"] += score
+                topic_stats[topic]["count"] += 1
+                if error_type and error_type != "none":
+                    topic_stats[topic]["errors"][error_type] = topic_stats[topic]["errors"].get(error_type, 0) + 1
+                if marks_aw is not None and marks_tot:
+                    topic_stats[topic]["marks_earned"] += marks_aw
+                    topic_stats[topic]["marks_possible"] += marks_tot
+            
+            # --- Student rankings ---
+            if email:
+                if email not in student_data:
+                    student_data[email] = {"scores": [], "time": 0, "count": 0}
+                student_data[email]["scores"].append(score)
+                student_data[email]["time"] += time_spent
+                student_data[email]["count"] += 1
+            
+            # --- Time by day of week ---
+            if date_key != "unknown" and time_spent > 0:
+                if date_key not in time_by_day:
+                    time_by_day[date_key] = 0
+                time_by_day[date_key] += time_spent
+            
+            # --- Marks data for export ---
+            marks_data.append({
+                "date": date_key,
+                "student": email,
+                "problem": problem,
+                "topic": topic,
+                "score": score,
+                "error_type": error_type if error_type != "none" else "",
+                "marks_awarded": marks_aw,
+                "marks_total": marks_tot,
+                "time_seconds": time_spent
+            })
+        
+        # Process daily scores into sorted list
+        score_trend = []
+        for date_key in sorted(daily_scores.keys()):
+            d = daily_scores[date_key]
+            score_trend.append({
+                "date": date_key,
+                "avg_score": round(d["total"] / d["count"], 1) if d["count"] else 0,
+                "submissions": d["count"]
+            })
+        
+        # Process topic stats
+        topic_performance = []
+        for topic, stats in topic_stats.items():
+            topic_performance.append({
+                "topic": topic,
+                "avg_score": round(stats["total_score"] / stats["count"], 1) if stats["count"] else 0,
+                "attempts": stats["count"],
+                "top_error": max(stats["errors"], key=stats["errors"].get) if stats["errors"] else None,
+                "marks_pct": round(stats["marks_earned"] / stats["marks_possible"] * 100, 1) if stats["marks_possible"] else None
+            })
+        topic_performance.sort(key=lambda x: x["avg_score"])
+        
+        # Process student rankings
+        student_rankings = []
+        for email, data in student_data.items():
+            avg = round(sum(data["scores"]) / len(data["scores"]), 1) if data["scores"] else 0
+            # Calculate improvement: compare first half vs second half of scores
+            scores = data["scores"]
+            improvement = 0
+            if len(scores) >= 4:
+                mid = len(scores) // 2
+                first_half = sum(scores[:mid]) / mid
+                second_half = sum(scores[mid:]) / (len(scores) - mid)
+                improvement = round(second_half - first_half, 1)
+            student_rankings.append({
+                "email": email,
+                "name": email.split("@")[0],
+                "avg_score": avg,
+                "problems_solved": data["count"],
+                "total_time_min": round(data["time"] / 60, 1),
+                "improvement": improvement
+            })
+        student_rankings.sort(key=lambda x: x["avg_score"], reverse=True)
+        
+        # Time trend
+        time_trend = []
+        for date_key in sorted(time_by_day.keys()):
+            time_trend.append({
+                "date": date_key,
+                "minutes": round(time_by_day[date_key] / 60, 1)
+            })
+        
+        result = {
+            "score_trend": score_trend,
+            "topic_performance": topic_performance,
+            "student_rankings": student_rankings,
+            "time_trend": time_trend,
+            "export_data": marks_data,
+            "summary": {
+                "total_submissions": len(marks_data),
+                "total_students": len(student_data),
+                "overall_avg": round(sum(s["avg_score"] for s in student_rankings) / len(student_rankings), 1) if student_rankings else 0,
+                "topics_covered": len(topic_performance)
+            }
+        }
+        cache_set("analytics", result)
+        return jsonify(result), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Analytics failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+# ============================================================================
 # PROFESSOR FEEDBACK ON STUDENT ATTEMPTS
 # ============================================================================
 

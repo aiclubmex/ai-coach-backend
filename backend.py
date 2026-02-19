@@ -1110,16 +1110,42 @@ def professor_analytics():
     Comprehensive analytics for professor dashboard.
     Returns: score trends, topic performance, student rankings, time analysis.
     Cross-references activities with problems DB for topic data.
+    Optional query param: ?group=1A to filter by student group.
     """
     if not ACTIVITY_DB_ID:
         return jsonify({"error": "ACTIVITY_DB_ID not configured"}), 500
     
-    cached = cache_get("analytics")
+    group_filter = request.args.get("group", "").strip()
+    cache_key = f"analytics-{group_filter}" if group_filter else "analytics"
+    
+    cached = cache_get(cache_key)
     if cached:
-        print("[CACHE HIT] analytics")
+        print(f"[CACHE HIT] {cache_key}")
         return jsonify(cached), 200
     
     try:
+        # If group filter, get emails for that group first
+        group_emails = None
+        available_groups = set()
+        if USERS_DB_ID:
+            try:
+                users = query_database(USERS_DB_ID)
+                for u in users:
+                    g = u.get("group") or u.get("Group") or ""
+                    if g:
+                        available_groups.add(g)
+                if group_filter:
+                    group_emails = set()
+                    for u in users:
+                        g = u.get("group") or u.get("Group") or ""
+                        if g == group_filter:
+                            email = u.get("Email") or u.get("email") or ""
+                            if email:
+                                group_emails.add(email)
+                    print(f"[ANALYTICS] Group '{group_filter}': {len(group_emails)} students")
+            except Exception as e:
+                print(f"[ANALYTICS] Could not load users for group filter: {e}")
+        
         all_activities = query_database(
             ACTIVITY_DB_ID,
             sorts=[{"property": "timestamp", "direction": "descending"}],
@@ -1164,6 +1190,11 @@ def professor_analytics():
                 continue
             
             email = act.get("user_email", "")
+            
+            # Filter by group if specified
+            if group_emails is not None and email not in group_emails:
+                continue
+            
             score = act.get("score", 0) or 0
             timestamp = act.get("timestamp", "")
             time_spent = act.get("time_spent_seconds", 0) or 0
@@ -1286,6 +1317,8 @@ def professor_analytics():
             "student_rankings": student_rankings,
             "time_trend": time_trend,
             "export_data": marks_data,
+            "available_groups": sorted(list(available_groups)),
+            "current_group": group_filter or "all",
             "summary": {
                 "total_submissions": len(marks_data),
                 "total_students": len(student_data),
@@ -1293,7 +1326,7 @@ def professor_analytics():
                 "topics_covered": len(topic_performance)
             }
         }
-        cache_set("analytics", result)
+        cache_set(cache_key, result)
         return jsonify(result), 200
         
     except Exception as e:

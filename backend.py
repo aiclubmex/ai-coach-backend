@@ -1784,7 +1784,7 @@ Respond with ONLY a valid JSON object (no markdown, no backticks):
 """
         
         # 3. Call Claude API
-        response_text = call_anthropic(prompt, max_tokens=2000)
+        response_text = call_anthropic_api(prompt, max_tokens=2000)
         
         # 4. Parse response
         import re
@@ -1913,7 +1913,7 @@ EVALUATE and respond with ONLY a valid JSON object (no markdown, no backticks):
         if has_image:
             response_text = call_anthropic_vision(prompt, image_base64, image_media_type, max_tokens=1500)
         else:
-            response_text = call_anthropic(prompt, max_tokens=1500)
+            response_text = call_anthropic_api(prompt, max_tokens=1500)
         
         # Parse result
         import re

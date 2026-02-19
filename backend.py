@@ -846,6 +846,7 @@ def all_users():
             
             # Include solution_text in recent activities for professor review
             recent_activities = []
+            error_counts = {}
             for activity in user_activities[:10]:
                 display_name = activity.get("problem_reference") or activity.get("problem_name", "Unknown")
                 recent_activities.append({
@@ -854,8 +855,19 @@ def all_users():
                     "score": activity.get("score", 0) or 0,
                     "time_spent_seconds": activity.get("time_spent_seconds", 0) or 0,
                     "timestamp": activity.get("timestamp", ""),
-                    "solution_text": activity.get("solution_text", "")  # NEW
+                    "solution_text": activity.get("solution_text", ""),
+                    "error_type": activity.get("error_type", ""),
+                    "marks_awarded": activity.get("marks_awarded"),
+                    "marks_total": activity.get("marks_total"),
+                    "attempt_number": activity.get("attempt_number")
                 })
+            
+            # Aggregate error patterns for this student
+            for activity in user_activities:
+                if activity.get("action") == "completed":
+                    etype = activity.get("error_type", "").strip().lower()
+                    if etype and etype != "none":
+                        error_counts[etype] = error_counts.get(etype, 0) + 1
             
             user_stats_list.append({
                 "email": email,
@@ -866,7 +878,8 @@ def all_users():
                 "problems_completed": len(problems_completed),
                 "avg_score": round(sum(scores) / len(scores), 1) if scores else 0,
                 "total_time_minutes": total_time // 60,
-                "recent_activities": recent_activities
+                "recent_activities": recent_activities,
+                "error_patterns": error_counts
             })
         
         total_students = len(user_stats_list)
@@ -901,6 +914,126 @@ def all_users():
         import traceback
         traceback.print_exc()
         return jsonify({"error": f"Failed to get users: {str(e)}"}), 500
+
+# ============================================================================
+# ERROR PATTERNS ANALYTICS
+# ============================================================================
+
+@app.get("/api/professor/error-patterns")
+def error_patterns():
+    """
+    Aggregate error pattern analytics across all students.
+    Returns: error distribution, per-student breakdown, per-problem breakdown, insights.
+    """
+    if not ACTIVITY_DB_ID:
+        return jsonify({"error": "ACTIVITY_DB_ID not configured"}), 500
+    
+    try:
+        all_activities = query_database(ACTIVITY_DB_ID)
+        
+        # Global error distribution
+        global_errors = {}
+        # Per-student errors
+        student_errors = {}
+        # Per-problem errors  
+        problem_errors = {}
+        # Score by error type
+        error_scores = {}
+        # Timeline (last 30 activities with errors)
+        error_timeline = []
+        
+        for activity in all_activities:
+            if activity.get("action") != "completed":
+                continue
+            
+            etype = (activity.get("error_type") or "").strip().lower()
+            if not etype or etype == "none":
+                continue
+            
+            email = activity.get("user_email", "")
+            problem = activity.get("problem_reference") or activity.get("problem_name", "Unknown")
+            score = activity.get("score", 0) or 0
+            timestamp = activity.get("timestamp", "")
+            
+            # Global counts
+            global_errors[etype] = global_errors.get(etype, 0) + 1
+            
+            # Per-student
+            if email not in student_errors:
+                student_errors[email] = {}
+            student_errors[email][etype] = student_errors[email].get(etype, 0) + 1
+            
+            # Per-problem
+            if problem not in problem_errors:
+                problem_errors[problem] = {}
+            problem_errors[problem][etype] = problem_errors[problem].get(etype, 0) + 1
+            
+            # Score by error type
+            if etype not in error_scores:
+                error_scores[etype] = []
+            error_scores[etype].append(score)
+            
+            # Timeline
+            error_timeline.append({
+                "email": email,
+                "problem": problem,
+                "error_type": etype,
+                "score": score,
+                "timestamp": timestamp
+            })
+        
+        # Sort timeline by timestamp descending
+        error_timeline.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        
+        # Calculate avg score per error type
+        avg_by_error = {}
+        for etype, scores_list in error_scores.items():
+            avg_by_error[etype] = round(sum(scores_list) / len(scores_list), 1) if scores_list else 0
+        
+        # Generate insights
+        insights = []
+        total_errors = sum(global_errors.values())
+        if total_errors > 0:
+            # Most common error
+            most_common = max(global_errors, key=global_errors.get)
+            insights.append({
+                "type": "most_common",
+                "icon": "🔴",
+                "text": f"Most common error: {most_common} ({global_errors[most_common]} occurrences, {round(global_errors[most_common]/total_errors*100)}% of all errors)"
+            })
+            
+            # Lowest scoring error type
+            if avg_by_error:
+                lowest = min(avg_by_error, key=avg_by_error.get)
+                insights.append({
+                    "type": "lowest_score",
+                    "icon": "⚠️",
+                    "text": f"Hardest error type: {lowest} (avg score {avg_by_error[lowest]}%)"
+                })
+            
+            # Students with most errors
+            if student_errors:
+                student_totals = {e: sum(errs.values()) for e, errs in student_errors.items()}
+                struggling = max(student_totals, key=student_totals.get)
+                insights.append({
+                    "type": "needs_help",
+                    "icon": "🆘",
+                    "text": f"Student needing most support: {struggling} ({student_totals[struggling]} total errors)"
+                })
+        
+        return jsonify({
+            "global_distribution": global_errors,
+            "avg_score_by_error": avg_by_error,
+            "student_errors": student_errors,
+            "problem_errors": problem_errors,
+            "recent_errors": error_timeline[:30],
+            "insights": insights,
+            "total_errors": total_errors if total_errors else 0
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Error patterns failed: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # ============================================================================
 # HOMEWORK SYSTEM - UPDATED WITH time_limit_minutes

@@ -422,6 +422,7 @@ def submit_solution():
     
     try:
         problem = fetch_page(problem_id)
+        print(f"[SUBMIT] Problem loaded: name='{problem.get('name','')}', ref='{problem.get('problem_reference','')}', statement='{(problem.get('problem_statement','') or '')[:80]}'...")
         
         # --- QUICK WIN 3: Count previous attempts ---
         problem_ref = problem.get("problem_reference", "")

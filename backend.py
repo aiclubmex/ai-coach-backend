@@ -1390,6 +1390,216 @@ def get_professor_feedback(activity_id):
         return jsonify({"error": str(e)}), 500
 
 # ============================================================================
+# PRACTICE MODE — INTELLIGENT REINFORCEMENT
+# ============================================================================
+
+@app.get("/api/student/practice-recommendations")
+@require_auth
+def practice_recommendations():
+    """
+    Analyze student weaknesses and recommend problems.
+    Returns 2 categories:
+    1. "topic_practice" — more problems on topics they've worked on
+    2. "weakness_reinforcement" — targeted problems for specific error patterns
+    
+    Uses: error_type, key_concept, topic, score from activity history.
+    Excludes problems already solved with score >= 70.
+    """
+    if not ACTIVITY_DB_ID or not NOTION_DB_ID:
+        return jsonify({"error": "Databases not configured"}), 500
+    
+    user = request.user
+    email = user.get("email")
+    
+    try:
+        # 1. Get student's activity history
+        activities = query_database(
+            ACTIVITY_DB_ID,
+            filter_obj={"property": "user_email", "email": {"equals": email}},
+            sorts=[{"property": "timestamp", "direction": "descending"}]
+        )
+        
+        # 2. Get all available problems
+        all_problems = query_database(NOTION_DB_ID, max_pages=5)
+        
+        # 3. Analyze student data
+        solved_well = set()  # problems scored >= 70
+        solved_any = set()   # all attempted problems
+        topic_scores = {}    # topic → [scores]
+        error_patterns = {}  # (topic, error_type) → count
+        weak_concepts = {}   # key_concept → {count, avg_score, error_types}
+        recent_topics = []   # last 10 topics worked on
+        
+        for act in activities:
+            if act.get("action") != "completed":
+                continue
+            
+            problem_ref = act.get("problem_reference") or act.get("problem_name", "")
+            score = act.get("score", 0) or 0
+            error_type = (act.get("error_type") or "").strip().lower()
+            key_concept = (act.get("key_concept") or "").strip()
+            
+            solved_any.add(problem_ref)
+            if score >= 70:
+                solved_well.add(problem_ref)
+            
+            # Find topic for this problem
+            topic = ""
+            for p in all_problems:
+                pref = p.get("reference") or p.get("Reference") or ""
+                pname = p.get("Name") or p.get("name") or ""
+                if pref == problem_ref or pname == problem_ref:
+                    kc = p.get("key_concepts") or p.get("Key Concepts") or ""
+                    if isinstance(kc, list):
+                        kc = kc[0] if kc else ""
+                    topic = kc.split(";")[0].strip() if kc else ""
+                    break
+            
+            if not topic and key_concept:
+                topic = key_concept
+            
+            if topic:
+                if topic not in topic_scores:
+                    topic_scores[topic] = []
+                topic_scores[topic].append(score)
+                
+                if len(recent_topics) < 10 and topic not in recent_topics:
+                    recent_topics.append(topic)
+                
+                # Track error patterns per topic
+                if error_type and error_type != "none":
+                    key = f"{topic}|{error_type}"
+                    error_patterns[key] = error_patterns.get(key, 0) + 1
+            
+            # Track weak concepts
+            if key_concept and score < 70:
+                if key_concept not in weak_concepts:
+                    weak_concepts[key_concept] = {"count": 0, "total_score": 0, "error_types": {}}
+                weak_concepts[key_concept]["count"] += 1
+                weak_concepts[key_concept]["total_score"] += score
+                if error_type and error_type != "none":
+                    weak_concepts[key_concept]["error_types"][error_type] = \
+                        weak_concepts[key_concept]["error_types"].get(error_type, 0) + 1
+        
+        # 4. Build problem lookup by topic
+        problems_by_topic = {}
+        for p in all_problems:
+            pid = p.get("id", "")
+            pname = p.get("Name") or p.get("name") or ""
+            pref = p.get("reference") or p.get("Reference") or ""
+            kc = p.get("key_concepts") or p.get("Key Concepts") or ""
+            if isinstance(kc, list):
+                kc = kc[0] if kc else ""
+            topic = kc.split(";")[0].strip() if kc else "Other"
+            marks = p.get("marks") or p.get("Marks") or 0
+            
+            identifier = pref or pname
+            
+            prob_obj = {
+                "id": pid,
+                "name": pname,
+                "reference": pref,
+                "topic": topic,
+                "marks": marks,
+                "already_solved": identifier in solved_well,
+                "attempted": identifier in solved_any
+            }
+            
+            if topic not in problems_by_topic:
+                problems_by_topic[topic] = []
+            problems_by_topic[topic].append(prob_obj)
+        
+        # 5. Generate TOPIC PRACTICE recommendations
+        topic_practice = []
+        for topic in recent_topics:
+            scores = topic_scores.get(topic, [])
+            avg_score = round(sum(scores) / len(scores), 1) if scores else 0
+            
+            # Find unsolved problems in this topic
+            available = [p for p in problems_by_topic.get(topic, []) if not p["already_solved"]]
+            
+            if available:
+                topic_practice.append({
+                    "topic": topic,
+                    "avg_score": avg_score,
+                    "problems_solved": len(scores),
+                    "problems_available": len(available),
+                    "status": "strong" if avg_score >= 80 else "developing" if avg_score >= 60 else "needs_work",
+                    "recommended_problems": available[:5]  # top 5 unsolved
+                })
+        
+        # Sort: weakest topics first
+        topic_practice.sort(key=lambda x: x["avg_score"])
+        
+        # 6. Generate WEAKNESS REINFORCEMENT recommendations
+        weakness_reinforcement = []
+        
+        # Find topics with specific error patterns
+        for key, count in sorted(error_patterns.items(), key=lambda x: x[1], reverse=True):
+            topic, error_type = key.split("|")
+            if count < 1:
+                continue
+            
+            # Find unsolved problems in this topic
+            available = [p for p in problems_by_topic.get(topic, []) if not p["already_solved"]]
+            
+            if available:
+                scores = topic_scores.get(topic, [])
+                avg = round(sum(scores) / len(scores), 1) if scores else 0
+                
+                weakness_reinforcement.append({
+                    "topic": topic,
+                    "error_type": error_type,
+                    "occurrences": count,
+                    "avg_score_in_topic": avg,
+                    "description": get_weakness_description(topic, error_type, count),
+                    "recommended_problems": available[:3]
+                })
+        
+        # Limit to top 5 weaknesses
+        weakness_reinforcement = weakness_reinforcement[:5]
+        
+        # 7. Summary
+        total_available = sum(1 for p in all_problems 
+                           if (p.get("reference") or p.get("Reference") or p.get("Name") or p.get("name") or "") not in solved_well)
+        
+        return jsonify({
+            "student_email": email,
+            "problems_solved": len(solved_well),
+            "problems_attempted": len(solved_any),
+            "total_problems": len(all_problems),
+            "problems_remaining": total_available,
+            "topic_practice": topic_practice,
+            "weakness_reinforcement": weakness_reinforcement,
+            "weak_concepts": [
+                {
+                    "concept": concept,
+                    "times_failed": data["count"],
+                    "avg_score": round(data["total_score"] / data["count"], 1),
+                    "main_error": max(data["error_types"], key=data["error_types"].get) if data["error_types"] else None
+                }
+                for concept, data in sorted(weak_concepts.items(), key=lambda x: x[1]["count"], reverse=True)[:5]
+            ]
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Practice recommendations failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+def get_weakness_description(topic, error_type, count):
+    """Generate a human-readable description of the weakness."""
+    error_descriptions = {
+        "conceptual": f"You've made conceptual errors in {topic} {count} time(s). Focus on understanding the underlying theory before solving.",
+        "calculation": f"You've made calculation mistakes in {topic} {count} time(s). Double-check your arithmetic and unit conversions.",
+        "units": f"You've had unit errors in {topic} {count} time(s). Always write units at each step and verify dimensional consistency.",
+        "method": f"You've used incorrect methods in {topic} {count} time(s). Review which formulas and approaches apply to this type of problem.",
+        "incomplete": f"You've submitted incomplete solutions in {topic} {count} time(s). Make sure to show all steps and reach a final answer."
+    }
+    return error_descriptions.get(error_type, f"You've had {error_type} errors in {topic} {count} time(s). Review this topic carefully.")
+
+# ============================================================================
 # HOMEWORK SYSTEM - UPDATED WITH time_limit_minutes
 # ============================================================================
 

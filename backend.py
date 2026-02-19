@@ -753,23 +753,53 @@ def user_stats():
                 if score > 0:
                     scores.append(score)
         
+        # Build problem reference → topic lookup from Problems DB
+        problem_topic_map = {}
+        if NOTION_DB_ID:
+            try:
+                all_problems = query_database(NOTION_DB_ID, max_pages=5)
+                for p in all_problems:
+                    pref = p.get("reference") or p.get("Reference") or ""
+                    pname = p.get("Name") or p.get("name") or ""
+                    kc = p.get("key_concepts") or p.get("Key Concepts") or ""
+                    if isinstance(kc, list):
+                        kc = kc[0] if kc else ""
+                    topic = kc.split(";")[0].strip() if kc else ""
+                    if pref and topic:
+                        problem_topic_map[pref] = topic
+                    if pname and topic:
+                        problem_topic_map[pname] = topic
+            except Exception as e:
+                print(f"[WARN] Could not load problems for topic map: {e}")
+        
         recent_activity = []
-        for activity in activities[:10]:
+        all_completed = []
+        for activity in activities:
             if activity.get("action") in ["completed", "submitted"]:
                 display_name = activity.get("problem_reference") or activity.get("problem_name", "Unknown")
-                recent_activity.append({
+                # Use key_concept from activity, fallback to problems DB lookup
+                key_concept = (activity.get("key_concept") or "").strip()
+                if not key_concept:
+                    key_concept = problem_topic_map.get(display_name, "")
+                entry = {
                     "problem_name": display_name,
                     "score": activity.get("score", 0) or 0,
                     "timestamp": activity.get("timestamp", ""),
                     "action": activity.get("action", ""),
-                    "professor_feedback": activity.get("professor_feedback", "")
-                })
+                    "professor_feedback": activity.get("professor_feedback", ""),
+                    "error_type": activity.get("error_type", ""),
+                    "key_concept": key_concept
+                }
+                all_completed.append(entry)
+                if len(recent_activity) < 10:
+                    recent_activity.append(entry)
         
         return jsonify({
             "solved_count": len(problems_completed),
             "average_score": round(sum(scores) / len(scores), 1) if scores else 0,
             "total_time_seconds": total_time,
-            "recent_activity": recent_activity
+            "recent_activity": recent_activity,
+            "all_completed": all_completed
         }), 200
         
     except Exception as e:

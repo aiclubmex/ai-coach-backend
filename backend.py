@@ -2737,10 +2737,11 @@ def mock_history():
             ref = act.get("problem_reference") or ""
             name = act.get("problem_name") or ""
             
-            if ref.startswith("mock-weakness-") or name.startswith("[Mock]"):
+            if ref.startswith("mock-") or name.startswith("[Mock]"):
+                # All mock problems share session: mock-{timestamp}-{index}
                 parts = ref.split("-")
-                if len(parts) >= 3:
-                    mock_id = "-".join(parts[:3])
+                if len(parts) >= 2:
+                    mock_id = "-".join(parts[:2])  # mock-{timestamp}
                 else:
                     mock_id = ref
                 

@@ -2751,7 +2751,7 @@ def mock_build():
                     "topic": topic,
                     "source": "real",
                     "problem_id": pid,
-                    "problem_reference": full.get("reference") or full.get("Reference") or full.get("Name") or full.get("name") or "",
+                    "problem_reference": full.get("problem_reference") or full.get("reference") or full.get("Reference") or full.get("Name") or full.get("name") or "",
                     "pdf_page_number": full.get("pdf_page_number") or full.get("Pdf_page_number") or None
                 })
             except Exception as e:

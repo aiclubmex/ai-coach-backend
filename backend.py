@@ -2513,5 +2513,278 @@ def get_student_homework_for_professor():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ==========================================
+# MOCK EXAM ENDPOINTS
+# ==========================================
+
+@app.route("/api/mock/create-weakness", methods=["POST"])
+@require_auth
+def create_weakness_mock():
+    """
+    Generate a weakness-based mock exam.
+    Uses activity history to find weak topics, then generates problems for each.
+    
+    Optional input JSON:
+    - num_problems: 3-5 (default 4)
+    - marks_per_problem: default 4
+    
+    Returns: { type, title, problems[], total_marks, topics, weakness_data, created_at }
+    """
+    user = request.user
+    email = user.get("email", "")
+    data = request.get_json(force=True, silent=True) or {}
+    num_problems = min(5, max(3, int(data.get("num_problems", 4))))
+    marks_per = int(data.get("marks_per_problem", 4))
+    
+    try:
+        # 1. Get student's activity to find weaknesses
+        activities = query_database(
+            ACTIVITY_DB_ID,
+            filter_obj={"property": "user_email", "email": {"equals": email}},
+            sorts=[{"property": "timestamp", "direction": "descending"}]
+        )
+        
+        all_problems = query_database(NOTION_DB_ID, max_pages=5)
+        
+        # 2. Analyze weaknesses
+        topic_scores = {}
+        error_patterns = {}
+        
+        for act in activities:
+            if act.get("action") != "completed":
+                continue
+            score = act.get("score", 0) or 0
+            error_type = (act.get("error_type") or "").strip().lower()
+            key_concept = (act.get("key_concept") or "").strip()
+            
+            problem_ref = act.get("problem_reference") or act.get("problem_name", "")
+            topic = ""
+            for p in all_problems:
+                pref = p.get("reference") or p.get("Reference") or ""
+                pname = p.get("Name") or p.get("name") or ""
+                if pref == problem_ref or pname == problem_ref:
+                    kc = p.get("key_concepts") or p.get("Key Concepts") or ""
+                    if isinstance(kc, list):
+                        kc = kc[0] if kc else ""
+                    topic = kc.split(";")[0].strip() if kc else ""
+                    break
+            
+            if not topic and key_concept:
+                topic = key_concept
+            
+            if topic:
+                if topic not in topic_scores:
+                    topic_scores[topic] = []
+                topic_scores[topic].append(score)
+                
+                if error_type and error_type != "none":
+                    key = (topic, error_type)
+                    error_patterns[key] = error_patterns.get(key, 0) + 1
+        
+        # 3. Rank topics by weakness (lowest avg score first)
+        weak_topics = []
+        for topic, scores in topic_scores.items():
+            avg = sum(scores) / len(scores)
+            if avg < 85:
+                weak_topics.append({
+                    "topic": topic,
+                    "avg_score": round(avg, 1),
+                    "attempts": len(scores),
+                    "main_error": ""
+                })
+        
+        weak_topics.sort(key=lambda x: x["avg_score"])
+        
+        # Add main error type per topic
+        for wt in weak_topics:
+            topic_errors = {k: v for k, v in error_patterns.items() if k[0] == wt["topic"]}
+            if topic_errors:
+                top_error = max(topic_errors, key=topic_errors.get)
+                wt["main_error"] = top_error[1]
+        
+        # Fallback if no weak topics found
+        if not weak_topics:
+            all_topics = set()
+            for p in all_problems:
+                kc = p.get("key_concepts") or p.get("Key Concepts") or ""
+                if isinstance(kc, list):
+                    kc = kc[0] if kc else ""
+                t = kc.split(";")[0].strip() if kc else ""
+                if t:
+                    all_topics.add(t)
+            weak_topics = [{"topic": t, "avg_score": 50, "attempts": 0, "main_error": ""} for t in list(all_topics)[:num_problems]]
+        
+        # 4. Select topics for mock
+        selected = weak_topics[:num_problems]
+        
+        # 5. Generate problems
+        import random as rand_mod
+        import json as json_mod
+        generated = []
+        
+        for wt in selected:
+            try:
+                topic_problems = []
+                for p in all_problems:
+                    kc = p.get("key_concepts") or p.get("Key Concepts") or ""
+                    if isinstance(kc, list):
+                        kc = kc[0] if kc else ""
+                    p_topic = kc.split(";")[0].strip().lower() if kc else ""
+                    if wt["topic"].lower() in p_topic or p_topic in wt["topic"].lower():
+                        topic_problems.append(p)
+                
+                template_text = ""
+                if topic_problems:
+                    samples = rand_mod.sample(topic_problems, min(2, len(topic_problems)))
+                    for s in samples:
+                        try:
+                            full = fetch_page(s.get("id", ""))
+                            template_text += f"\nName: {full.get('name','')}\nStatement: {full.get('problem_statement','')}\nMarks: {full.get('marks', marks_per)}\nSolution: {full.get('full_solution','')}\n---\n"
+                        except:
+                            pass
+                
+                error_focus = f"\nFocus on testing areas where students commonly make {wt['main_error']} errors." if wt.get("main_error") else ""
+                
+                gen_prompt = f"""You are an expert IB Physics HL exam creator.
+
+Create a NEW problem about {wt['topic']} worth {marks_per} marks.{error_focus}
+
+{('REFERENCE EXAMPLES:\n' + template_text) if template_text else ''}
+
+REQUIREMENTS:
+- IB Physics HL standard difficulty
+- Include all given values with SI units
+- Must be solvable step-by-step
+- Marks must follow IB conventions
+
+Respond with ONLY valid JSON:
+{{
+  "name": "[AI Mock] {wt['topic']} Problem",
+  "problem_statement": "...",
+  "given_values": "...",
+  "find": "...",
+  "marks": {marks_per},
+  "key_concept": "{wt['topic']}",
+  "full_solution": "Complete step-by-step solution...",
+  "final_answer": "..."
+}}"""
+                
+                result = call_anthropic_api(gen_prompt, max_tokens=2000)
+                
+                clean = result.strip()
+                if clean.startswith("```"):
+                    clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
+                    if clean.endswith("```"):
+                        clean = clean[:-3]
+                    clean = clean.strip()
+                
+                problem_data = json_mod.loads(clean)
+                problem_data["topic"] = wt["topic"]
+                problem_data["weakness_score"] = wt["avg_score"]
+                problem_data["target_error"] = wt.get("main_error", "")
+                generated.append(problem_data)
+                
+            except Exception as e:
+                print(f"Error generating mock problem for {wt['topic']}: {e}")
+                continue
+        
+        if not generated:
+            return jsonify({"error": "Could not generate problems"}), 500
+        
+        mock_result = {
+            "type": "weakness",
+            "title": "Weakness Practice",
+            "problems": generated,
+            "topics": [g["topic"] for g in generated],
+            "total_marks": sum(g.get("marks", marks_per) for g in generated),
+            "weakness_data": selected,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        return jsonify(mock_result)
+        
+    except Exception as e:
+        print(f"Error creating weakness mock: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/mock/history", methods=["GET"])
+@require_auth
+def mock_history():
+    """
+    Get mock exam history for the current student.
+    Looks for activities with source='mock_weakness' and groups them by session.
+    """
+    user = request.user
+    email = user.get("email", "")
+    
+    try:
+        activities = query_database(
+            ACTIVITY_DB_ID,
+            filter_obj={
+                "and": [
+                    {"property": "user_email", "email": {"equals": email}},
+                    {"property": "action", "select": {"equals": "completed"}}
+                ]
+            },
+            sorts=[{"property": "timestamp", "direction": "descending"}]
+        )
+        
+        mocks = {}
+        for act in activities:
+            ref = act.get("problem_reference") or ""
+            name = act.get("problem_name") or ""
+            
+            if ref.startswith("mock-weakness-") or name.startswith("[Mock]"):
+                parts = ref.split("-")
+                if len(parts) >= 3:
+                    mock_id = "-".join(parts[:3])
+                else:
+                    mock_id = ref
+                
+                if mock_id not in mocks:
+                    mocks[mock_id] = {
+                        "mock_id": mock_id,
+                        "date": act.get("timestamp", ""),
+                        "problems": [],
+                        "total_score": 0,
+                        "total_marks_awarded": 0,
+                        "total_marks": 0
+                    }
+                
+                score = act.get("score", 0) or 0
+                marks_awarded = act.get("marks_awarded", 0) or 0
+                marks_total = act.get("marks_total", 0) or 0
+                
+                mocks[mock_id]["problems"].append({
+                    "topic": act.get("key_concept") or "",
+                    "score": score,
+                    "marks_awarded": marks_awarded,
+                    "marks_total": marks_total,
+                    "error_type": act.get("error_type") or "",
+                    "time_spent": act.get("time_spent_seconds", 0) or 0
+                })
+                mocks[mock_id]["total_score"] += score
+                mocks[mock_id]["total_marks_awarded"] += marks_awarded
+                mocks[mock_id]["total_marks"] += marks_total
+        
+        mock_list = []
+        for m in mocks.values():
+            if m["problems"]:
+                m["avg_score"] = round(m["total_score"] / len(m["problems"]), 1)
+                m["num_problems"] = len(m["problems"])
+                mock_list.append(m)
+        
+        mock_list.sort(key=lambda x: x["date"], reverse=True)
+        
+        return jsonify({"mocks": mock_list[:20]})
+        
+    except Exception as e:
+        print(f"Error fetching mock history: {e}")
+        return jsonify({"mocks": []})
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

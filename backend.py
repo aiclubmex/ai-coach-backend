@@ -1420,6 +1420,138 @@ def get_professor_feedback(activity_id):
         return jsonify({"error": str(e)}), 500
 
 # ============================================================================
+# AI STUDENT ANALYSIS (Claude-powered) — NEW
+# ============================================================================
+
+@app.get("/api/professor/ai-student-analysis")
+def ai_student_analysis():
+    """AI-powered deep analysis of a student's performance."""
+    email = request.args.get("email", "").strip()
+    if not email:
+        return jsonify({"error": "missing email parameter"}), 400
+    
+    try:
+        activities = query_database(
+            ACTIVITY_DB_ID,
+            filter_obj={"property": "user_email", "email": {"equals": email}},
+            sorts=[{"property": "timestamp", "direction": "descending"}]
+        )
+        
+        completed = [a for a in activities if a.get("action") in ("completed", "submitted")]
+        
+        if len(completed) < 2:
+            return jsonify({
+                "analysis": {
+                    "summary": "Not enough data for AI analysis. The student needs to complete at least 2 problems.",
+                    "patterns": [],
+                    "predictions": [],
+                    "recommendations": ["Encourage the student to complete more practice problems to enable AI analysis."]
+                },
+                "activities_analyzed": len(completed)
+            })
+        
+        # Build structured student data for Claude
+        student_data_lines = []
+        for a in completed[:50]:
+            sol = (a.get("solution_text") or "")[:100]
+            line = (
+                f"Problem: {a.get('problem_name', 'Unknown')} ({a.get('problem_reference', '')})\n"
+                f"  Score: {a.get('score', 0)}% | "
+                f"Marks: {a.get('marks_awarded', '?')}/{a.get('marks_total', '?')} | "
+                f"Time: {a.get('time_spent_seconds', 0)}s | "
+                f"Error: {a.get('error_type', 'none')} | "
+                f"Concept: {a.get('key_concept', '')} | "
+                f"Attempt #{a.get('attempt_number', 1)}"
+            )
+            if sol:
+                line += f"\n  Solution preview: {sol}"
+            student_data_lines.append(line)
+        
+        # Error type distribution
+        error_counts = {}
+        for a in completed:
+            et = (a.get("error_type") or "").strip()
+            if et and et != "none":
+                error_counts[et] = error_counts.get(et, 0) + 1
+        
+        # Topic/concept performance
+        topic_scores = {}
+        for a in completed:
+            concept = (a.get("key_concept") or "").strip() or "Unknown"
+            if concept not in topic_scores:
+                topic_scores[concept] = []
+            topic_scores[concept].append(a.get("score", 0) or 0)
+        
+        topic_summary = []
+        for topic, scores in topic_scores.items():
+            avg = round(sum(scores) / len(scores)) if scores else 0
+            topic_summary.append(f"{topic}: avg {avg}% ({len(scores)} problems)")
+        
+        overall_avg = round(sum(a.get("score", 0) or 0 for a in completed) / len(completed))
+        
+        prompt = f"""You are an expert IB Physics teacher analyzing a student's performance data.
+
+STUDENT DATA ({len(completed)} completed problems):
+
+{chr(10).join(student_data_lines[:50])}
+
+ERROR TYPE DISTRIBUTION:
+{chr(10).join(f'  {k}: {v} occurrences' for k, v in sorted(error_counts.items(), key=lambda x: -x[1])) if error_counts else '  No errors recorded yet'}
+
+TOPIC/CONCEPT PERFORMANCE:
+{chr(10).join(f'  {t}' for t in sorted(topic_summary))}
+
+OVERALL: Avg score = {overall_avg}%, {len(completed)} problems completed
+
+Analyze this student and respond ONLY with a JSON object (no markdown, no backticks, no extra text):
+{{
+  "summary": "2-3 sentences summarizing overall performance, strengths, and main areas of concern",
+  "patterns": ["pattern 1 - be specific about topics and error types", "pattern 2", "pattern 3"],
+  "predictions": ["prediction about upcoming exam performance based on the data"],
+  "recommendations": ["specific actionable recommendation for the PROFESSOR", "recommendation 2", "recommendation 3"]
+}}
+
+RULES:
+- Be specific, reference actual topics and error types from the data
+- Patterns: identify RECURRING issues (e.g. 'Consistently makes unit conversion errors in Circuits')
+- Predictions: be concrete (e.g. 'Likely to struggle with EM Induction if Magnetism weakness not addressed')
+- Recommendations: actionable for the PROFESSOR (e.g. 'Schedule review session on free-body diagrams')
+- Keep each item to 1-2 sentences max
+- Write in English
+- Return ONLY the JSON object, nothing else"""
+
+        response_text = call_anthropic_api(prompt, max_tokens=1000)
+        
+        # Clean response
+        clean_response = response_text.strip()
+        if clean_response.startswith('```'):
+            clean_response = '\n'.join(clean_response.split('\n')[1:-1])
+            if clean_response.endswith('```'):
+                clean_response = clean_response[:-3]
+            clean_response = clean_response.strip()
+        
+        try:
+            analysis = json.loads(clean_response)
+        except json.JSONDecodeError:
+            analysis = {
+                "summary": clean_response[:500],
+                "patterns": [],
+                "predictions": [],
+                "recommendations": []
+            }
+        
+        return jsonify({
+            "analysis": analysis,
+            "activities_analyzed": len(completed)
+        })
+        
+    except Exception as e:
+        print(f"[AI ANALYSIS ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)[:200]}), 500
+
+# ============================================================================
 # PRACTICE MODE — INTELLIGENT REINFORCEMENT
 # ============================================================================
 

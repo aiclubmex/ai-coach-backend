@@ -1430,6 +1430,11 @@ def ai_student_analysis():
     if not email:
         return jsonify({"error": "missing email parameter"}), 400
     
+    # Period filtering: "30d", "custom", or "all" (default)
+    period = request.args.get("period", "all").strip()
+    from_date = request.args.get("from", "").strip()  # ISO format: 2026-01-15
+    to_date = request.args.get("to", "").strip()       # ISO format: 2026-03-01
+    
     try:
         activities = query_database(
             ACTIVITY_DB_ID,
@@ -1438,6 +1443,21 @@ def ai_student_analysis():
         )
         
         completed = [a for a in activities if a.get("action") in ("completed", "submitted")]
+        
+        # Apply time filter
+        period_label = "all time"
+        if period == "30d":
+            from datetime import datetime, timedelta
+            cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
+            completed = [a for a in completed if (a.get("timestamp") or "") >= cutoff]
+            period_label = "last 30 days"
+        elif period == "custom" and from_date:
+            completed = [a for a in completed if (a.get("timestamp") or "") >= from_date]
+            if to_date:
+                # Add T23:59:59 to include the full end day
+                to_cutoff = to_date + "T23:59:59" if "T" not in to_date else to_date
+                completed = [a for a in completed if (a.get("timestamp") or "") <= to_cutoff]
+            period_label = f"{from_date} to {to_date}" if to_date else f"since {from_date}"
         
         if len(completed) < 2:
             return jsonify({
@@ -1501,7 +1521,7 @@ ERROR TYPE DISTRIBUTION:
 TOPIC/CONCEPT PERFORMANCE:
 {chr(10).join(f'  {t}' for t in sorted(topic_summary))}
 
-OVERALL: Avg score = {overall_avg}%, {len(completed)} problems completed
+OVERALL: Avg score = {overall_avg}%, {len(completed)} problems completed (period: {period_label})
 
 Analyze this student and respond ONLY with a JSON object (no markdown, no backticks, no extra text):
 {{
@@ -1542,7 +1562,8 @@ RULES:
         
         return jsonify({
             "analysis": analysis,
-            "activities_analyzed": len(completed)
+            "activities_analyzed": len(completed),
+            "period": period_label
         })
         
     except Exception as e:

@@ -608,46 +608,90 @@ def chat():
 
 @app.post("/api/register")
 def register():
-    data = request.get_json(force=True, silent=True) or {}
-    email = data.get("email", "").strip().lower()
-    name = data.get("name", "").strip()
-    password = data.get("password", "")
-    group = data.get("group", "").strip()  # NEW: group field
-    
-    if not email or not name or not password: 
+    data          = request.get_json(force=True, silent=True) or {}
+    email         = data.get("email", "").strip().lower()
+    name          = data.get("name", "").strip()
+    password      = data.get("password", "")
+    group         = data.get("group", "").strip()
+    role          = data.get("role", "student").strip().lower()        # student | professor
+    prof_type     = data.get("professor_type", "").strip().lower()    # independent | institutional
+
+    if not email or not name or not password:
         return jsonify({"error": "Missing fields"}), 400
-    if not email.endswith("@asf.edu.mx"): 
-        return jsonify({"error": "Use ASF email"}), 400
-    
-    password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    
+
+    # Students must use ASF email; professors can use any email
+    if role == "student" and not email.endswith("@asf.edu.mx"):
+        return jsonify({"error": "Students must use ASF email (@asf.edu.mx)"}), 400
+
+    # Check for duplicate email
+    try:
+        existing = query_database(USERS_DB_ID, {"property": "Email", "email": {"equals": email}})
+        if existing:
+            return jsonify({"error": "Email already registered"}), 400
+    except Exception:
+        pass
+
+    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
     try:
         properties = {
-            "Name": {"title": [{"text": {"content": name}}]},
-            "Email": {"email": email},
+            "Name":          {"title":     [{"text": {"content": name}}]},
+            "Email":         {"email":     email},
             "password_hash": {"rich_text": [{"text": {"content": password_hash}}]},
-            "created_at": {"date": {"start": datetime.utcnow().isoformat()}}
+            "role":          {"select":    {"name": role}},
+            "created_at":    {"date":      {"start": datetime.utcnow().isoformat()}},
         }
-        
-        # Add group if provided
+
         if group:
             properties["group"] = {"select": {"name": group}}
-        
+
+        if prof_type and role == "professor":
+            properties["professor_type"] = {"select": {"name": prof_type}}
+
         create_page_in_database(USERS_DB_ID, properties)
-        return jsonify({"success": True}), 201
-    except Exception as e: 
+        return jsonify({"success": True, "role": role}), 201
+
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.post("/api/login")
 def login():
-    data = request.get_json(force=True, silent=True) or {}
-    email = data.get("email", "").lower()
+    data     = request.get_json(force=True, silent=True) or {}
+    email    = data.get("email", "").strip().lower()
     password = data.get("password", "")
+
     users = query_database(USERS_DB_ID, {"property": "Email", "email": {"equals": email}})
-    if not users or not bcrypt.checkpw(password.encode('utf-8'), users[0]["password_hash"].encode('utf-8')):
+    if not users:
         return jsonify({"error": "Invalid credentials"}), 401
-    token = jwt.encode({"email": email, "name": users[0]["Name"], "exp": datetime.utcnow() + timedelta(days=7)}, JWT_SECRET_KEY)
-    return jsonify({"success": True, "token": token, "user": {"email": email, "name": users[0]["Name"]}})
+
+    user    = users[0]
+    pw_hash = user.get("password_hash", "")
+    if not pw_hash or not bcrypt.checkpw(password.encode("utf-8"), pw_hash.encode("utf-8")):
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    role  = user.get("role", "student")
+    group = user.get("group") or user.get("Group") or ""
+    name  = user.get("Name") or user.get("name") or email.split("@")[0]
+
+    token = jwt.encode(
+        {
+            "email": email,
+            "name":  name,
+            "role":  role,
+            "group": group,
+            "exp":   datetime.utcnow() + timedelta(days=30),
+        },
+        JWT_SECRET_KEY,
+        algorithm="HS256",
+    )
+
+    return jsonify({
+        "success": True,
+        "token":   token,
+        "role":    role,
+        "group":   group,
+        "user":    {"email": email, "name": name, "role": role, "group": group},
+    })
 
 @app.get("/api/verify-session")
 @require_auth
@@ -3199,6 +3243,349 @@ def mock_history():
     except Exception as e:
         print(f"Error fetching mock history: {e}")
         return jsonify({"mocks": []})
+
+
+# ============================================================================
+# STUDY PLAN — Plan de Estudio Semanal (6 semanas al examen)
+# ============================================================================
+
+@app.get("/api/study-plan")
+@require_auth
+def get_study_plan():
+    """
+    Obtiene el plan de estudio completo de un alumno (6 semanas).
+    El profesor puede consultar cualquier alumno; el alumno solo ve el suyo.
+    Combina plan del profesor (si existe) con sugerencias IA para semanas vacías.
+    """
+    from collections import defaultdict
+
+    user  = request.user
+    role  = user.get("role", "student")
+    email = request.args.get("email", "").strip()
+
+    # Alumnos solo pueden ver su propio plan
+    if role == "student" or not email:
+        email = user.get("email", "")
+
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+
+    try:
+        # ── 1. ACTIVIDAD DEL ALUMNO ───────────────────────────
+        activities = []
+        if ACTIVITY_DB_ID:
+            activities = query_database(
+                ACTIVITY_DB_ID,
+                filter_obj={"property": "user_email", "email": {"equals": email}},
+                sorts=[{"property": "timestamp", "direction": "descending"}],
+            )
+        completed = [a for a in activities if a.get("action") in ("completed", "submitted")]
+
+        # ── 2. PLAN DEL PROFESOR (en Homework DB con prefijo [PLAN]) ──
+        plan_items_raw = []
+        if HOMEWORK_DB_ID:
+            all_hw = query_database(
+                HOMEWORK_DB_ID,
+                filter_obj={"property": "student_email", "email": {"equals": email}},
+            )
+            plan_items_raw = [h for h in all_hw if (h.get("Title") or "").startswith("[PLAN]")]
+
+        # ── 3. ANÁLISIS DE DEBILIDADES ────────────────────────
+        topic_scores = defaultdict(list)
+        error_counts = defaultdict(int)
+        for a in completed:
+            concept = (a.get("key_concept") or "").strip() or "General"
+            score   = a.get("score", 0) or 0
+            topic_scores[concept].append(score)
+            et = (a.get("error_type") or "").strip()
+            if et and et not in ("none", ""):
+                error_counts[et] += 1
+
+        topic_avgs     = {t: round(sum(s) / len(s)) for t, s in topic_scores.items() if s}
+        dominant_error = max(error_counts, key=error_counts.get) if error_counts else None
+
+        # ── 4. LISTA COMPLETA DE TOPICS IB PHYSICS HL ─────────
+        ib_topics = [
+            "Astrophysics", "Quantum", "Nuclear", "EM Induction", "Magnetism",
+            "Circuits", "Electric Fields", "Waves", "Optics", "Sound",
+            "Thermodynamics", "SHM", "Ideal Gases", "Gravitation", "Circular Motion",
+            "Momentum", "Work & Energy", "Forces", "Kinematics", "Rotational Dynamics",
+        ]
+        unpracticed     = [t for t in ib_topics if t not in topic_avgs]
+        priority_topics = [t for t, _ in sorted(topic_avgs.items(), key=lambda x: x[1])] + unpracticed
+
+        exam_date  = datetime(2026, 4, 28)
+        plan_start = datetime(2026, 3, 17)
+
+        # ── 5. CONSTRUIR LAS 6 SEMANAS ────────────────────────
+        weeks = []
+        for i in range(6):
+            week_start = plan_start + timedelta(weeks=i)
+            week_end   = week_start + timedelta(days=6)
+            week_num   = i + 1
+
+            # Plan del profesor para esta semana
+            plan_key   = f"[PLAN] Week {week_num}"
+            prof_item  = next(
+                (p for p in plan_items_raw if (p.get("Title") or "").startswith(plan_key)),
+                None,
+            )
+            prof_data = {}
+            if prof_item:
+                desc  = prof_item.get("description", "") or ""
+                parts = desc.split("|") if "|" in desc else [desc, "", ""]
+                prof_data = {
+                    "topic":    parts[0].strip() if len(parts) > 0 else "",
+                    "note":     parts[1].strip() if len(parts) > 1 else "",
+                    "problems": parts[2].strip() if len(parts) > 2 else "",
+                    "hw_id":    prof_item.get("id", ""),
+                }
+
+            # Sugerencia IA
+            ai_topic  = priority_topics[i] if i < len(priority_topics) else ib_topics[i % len(ib_topics)]
+            avg_topic = topic_avgs.get(ai_topic)
+            if avg_topic is not None:
+                if avg_topic < 50:
+                    ai_reason = f"Score de {avg_topic}% — prioridad alta para el examen"
+                elif avg_topic < 70:
+                    ai_reason = f"Score de {avg_topic}% — necesita refuerzo"
+                else:
+                    ai_reason = f"Score de {avg_topic}% — mantenimiento"
+            else:
+                ai_reason = "Topic no practicado todavía — cubrir antes del examen"
+
+            # Fase y metas por semana
+            if week_num <= 2:
+                phase, phase_label = "diagnosis",     "🔍 Diagnóstico"
+            elif week_num <= 4:
+                phase, phase_label = "reinforcement", "🎯 Refuerzo"
+            elif week_num == 5:
+                phase, phase_label = "consolidation", "📊 Consolidación"
+            else:
+                phase, phase_label = "exam",          "🏆 Semana del Examen"
+
+            rec_problems = {1: 5, 2: 6, 3: 8, 4: 8, 5: 10, 6: 4}.get(week_num, 6)
+            rec_mock     = {
+                1: "Weakness Mock al final de la semana",
+                2: "Topic Mock del topic asignado",
+                3: "Topic Mock del topic asignado",
+                4: "IB Final Mock (Exam Mode, 2h30m)",
+                5: "Segundo IB Final Mock",
+                6: "Weakness Mock final",
+            }.get(week_num, "Topic Mock")
+
+            # Estado de la semana
+            now = datetime.utcnow()
+            if now < week_start:
+                status = "upcoming"
+            elif now > week_end:
+                status = "completed"
+            else:
+                status = "active"
+
+            # Progreso real del alumno esta semana
+            week_acts   = [
+                a for a in completed
+                if week_start.isoformat()[:10] <= (a.get("timestamp") or "")[:10] <= week_end.isoformat()[:10]
+            ]
+            week_scores = [a.get("score", 0) or 0 for a in week_acts if (a.get("score", 0) or 0) > 0]
+            week_avg    = round(sum(week_scores) / len(week_scores)) if week_scores else None
+
+            weeks.append({
+                "week_number":  week_num,
+                "week_start":   week_start.strftime("%d %b"),
+                "week_end":     week_end.strftime("%d %b"),
+                "phase":        phase,
+                "phase_label":  phase_label,
+                "status":       status,
+                "days_to_exam": max(0, (exam_date - week_end).days),
+                "professor": {
+                    "set":      bool(prof_data),
+                    "topic":    prof_data.get("topic", ""),
+                    "note":     prof_data.get("note", ""),
+                    "problems": prof_data.get("problems", ""),
+                    "hw_id":    prof_data.get("hw_id", ""),
+                },
+                "ai": {
+                    "topic":          ai_topic,
+                    "reason":         ai_reason,
+                    "rec_problems":   rec_problems,
+                    "rec_mock":       rec_mock,
+                    "dominant_error": dominant_error,
+                },
+                "progress": {
+                    "problems_completed": len(week_acts),
+                    "avg_score":          week_avg,
+                    "on_track":           len(week_acts) >= int(rec_problems * 0.6) if status != "upcoming" else None,
+                },
+            })
+
+        # ── 6. RESUMEN GENERAL ────────────────────────────────
+        all_scores  = [a.get("score", 0) or 0 for a in completed if (a.get("score", 0) or 0) > 0]
+        overall_avg = round(sum(all_scores) / len(all_scores)) if all_scores else 0
+        boundaries  = [(75, 7), (63, 6), (52, 5), (40, 4), (28, 3), (16, 2), (0, 1)]
+        predicted   = next((g for b, g in boundaries if overall_avg >= b), 1)
+
+        return jsonify({
+            "student_email": email,
+            "exam_date":     "28 de abril 2026",
+            "weeks":         weeks,
+            "overview": {
+                "total_problems":     len(completed),
+                "overall_avg":        overall_avg,
+                "predicted_grade":    predicted,
+                "topics_covered":     len(topic_avgs),
+                "topics_total":       len(ib_topics),
+                "topics_strong":      sum(1 for s in topic_avgs.values() if s >= 85),
+                "topics_developing":  sum(1 for s in topic_avgs.values() if 65 <= s < 85),
+                "topics_weak":        sum(1 for s in topic_avgs.values() if s < 65),
+                "priority_topics":    priority_topics[:6],
+            },
+        }), 200
+
+    except Exception as e:
+        print(f"[STUDY PLAN ERROR] {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)[:300]}), 500
+
+
+@app.post("/api/professor/study-plan")
+@require_auth
+def set_study_plan():
+    """
+    El profesor establece o actualiza el plan de una semana para un alumno.
+    Guarda en Homework DB con prefijo [PLAN] para no requerir nueva DB.
+    Body: { student_email, week_number, topic, note, problems }
+    """
+    if not HOMEWORK_DB_ID:
+        return jsonify({"error": "HOMEWORK_DB_ID not configured"}), 500
+
+    data          = request.get_json() or {}
+    student_email = data.get("student_email", "").strip()
+    week_number   = int(data.get("week_number", 1))
+    topic         = data.get("topic", "").strip()
+    note          = data.get("note", "").strip()
+    problems      = data.get("problems", "").strip()
+
+    if not student_email or not topic:
+        return jsonify({"error": "Missing student_email or topic"}), 400
+
+    try:
+        plan_start  = datetime(2026, 3, 17)
+        week_start  = plan_start + timedelta(weeks=int(week_number) - 1)
+        week_end    = week_start + timedelta(days=6)
+        title       = f"[PLAN] Week {week_number} — {topic}"
+        description = f"{topic}|{note}|{problems}"
+
+        # Buscar si ya existe plan para esta semana
+        existing_hw  = query_database(
+            HOMEWORK_DB_ID,
+            filter_obj={"property": "student_email", "email": {"equals": student_email}},
+        )
+        plan_key      = f"[PLAN] Week {week_number}"
+        existing_item = next(
+            (h for h in existing_hw if (h.get("Title") or "").startswith(plan_key)),
+            None,
+        )
+
+        if existing_item:
+            page_id = existing_item.get("id", "")
+            if page_id:
+                update_page_properties(page_id, {
+                    "Title":       {"title":     [{"text": {"content": title}}]},
+                    "description": {"rich_text": [{"text": {"content": description}}]},
+                })
+                cache_clear()
+                return jsonify({"status": "updated", "week": week_number}), 200
+
+        create_page_in_database(HOMEWORK_DB_ID, {
+            "Title":         {"title":     [{"text": {"content": title}}]},
+            "student_email": {"email":     student_email},
+            "description":   {"rich_text": [{"text": {"content": description}}]},
+            "due_date":      {"date":      {"start": week_end.strftime("%Y-%m-%d")}},
+            "completed":     {"checkbox":  False},
+        })
+        cache_clear()
+        return jsonify({"status": "created", "week": week_number, "topic": topic}), 200
+
+    except Exception as e:
+        print(f"[SET STUDY PLAN ERROR] {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)[:300]}), 500
+
+
+@app.get("/api/study-plan/ai-generate-week")
+@require_auth
+def ai_generate_week_plan():
+    """
+    IA genera el plan detallado día a día para una semana específica.
+    Params: email, week_number
+    """
+    from collections import defaultdict
+
+    student_email = request.args.get("email", "").strip()
+    week_number   = int(request.args.get("week_number", 1))
+
+    if not student_email:
+        return jsonify({"error": "Missing email"}), 400
+
+    try:
+        activities = query_database(
+            ACTIVITY_DB_ID,
+            filter_obj={"property": "user_email", "email": {"equals": student_email}},
+            sorts=[{"property": "timestamp", "direction": "descending"}],
+        )
+        completed = [a for a in activities if a.get("action") in ("completed", "submitted")]
+
+        topic_scores = defaultdict(list)
+        for a in completed[:30]:
+            concept = (a.get("key_concept") or "").strip() or "General"
+            topic_scores[concept].append(a.get("score", 0) or 0)
+
+        topic_summary = "\n".join([
+            f"- {t}: {round(sum(s)/len(s))}% avg ({len(s)} problems)"
+            for t, s in sorted(topic_scores.items(), key=lambda x: sum(x[1]) / len(x[1]))[:8]
+        ]) or "No practice data yet"
+
+        plan_start = datetime(2026, 3, 17)
+        week_start = plan_start + timedelta(weeks=week_number - 1)
+        week_end   = week_start + timedelta(days=6)
+        days_left  = max(0, (datetime(2026, 4, 28) - week_end).days)
+
+        prompt = f"""You are an expert IB Physics HL tutor. Generate a specific weekly study plan.
+
+Week {week_number} of 6 ({week_start.strftime('%B %d')} to {week_end.strftime('%B %d, %Y')})
+Days to IB exam after this week: {days_left}
+Problems completed so far: {len(completed)}
+
+Topic performance:
+{topic_summary}
+
+Respond ONLY with valid JSON (no markdown, no backticks):
+{{
+  "topic_focus": "Main topic to work on this week",
+  "why": "1 sentence explaining why this topic is the priority",
+  "daily_plan": [
+    {{"day": "Monday-Tuesday", "action": "specific action", "time": "30 min"}},
+    {{"day": "Wednesday-Thursday", "action": "specific action", "time": "30 min"}},
+    {{"day": "Friday-Weekend", "action": "specific action", "time": "45 min"}}
+  ],
+  "mock_recommendation": "Which mock to do and when",
+  "success_metric": "How to know if the week was successful",
+  "professor_note": "What the teacher should focus on in the next session"
+}}"""
+
+        response = call_anthropic_api(prompt, max_tokens=700)
+        clean    = response.strip()
+        if clean.startswith("```"):
+            clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
+            clean = clean.rstrip("`").strip()
+        plan = json.loads(clean)
+        return jsonify({"week_number": week_number, "plan": plan}), 200
+
+    except Exception as e:
+        print(f"[AI WEEK PLAN ERROR] {e}")
+        return jsonify({"error": str(e)[:200]}), 500
 
 
 if __name__ == "__main__":

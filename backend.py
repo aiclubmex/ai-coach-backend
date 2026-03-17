@@ -364,6 +364,28 @@ def require_auth(f):
         except: return jsonify({"error": "Invalid/Expired token"}), 401
     return decorated_function
 
+
+def get_professor_groups(professor_group: str) -> list:
+    """
+    Devuelve lista de grupos de un profesor.
+    Soporta múltiples grupos separados por coma.
+    Ej: "ASF-PHY-12A,ASF-PHY-12B" → ["ASF-PHY-12A", "ASF-PHY-12B"]
+    """
+    if not professor_group:
+        return []
+    return [g.strip() for g in professor_group.split(",") if g.strip()]
+
+
+def professor_can_see_group(professor_group: str, student_group: str) -> bool:
+    """
+    Verifica si un profesor puede ver a un alumno según sus grupos.
+    Retorna True si el grupo del alumno está en la lista de grupos del profesor.
+    """
+    if not professor_group or not student_group:
+        return False
+    return student_group.strip() in get_professor_groups(professor_group)
+
+
 # ==============================
 # Base Routes
 # ==============================
@@ -931,12 +953,29 @@ def all_users():
         
         user_stats_list = []
         
+        # Get professor's groups from token if available
+        prof_groups = []
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header:
+            try:
+                token = auth_header.replace("Bearer ", "")
+                payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=["HS256"])
+                if payload.get("role") == "professor":
+                    prof_groups = get_professor_groups(payload.get("group", ""))
+            except Exception:
+                pass
+
         for user in users:
             email = user.get("Email", "")
             name = user.get("Name", "")
             group = user.get("group") or user.get("Group") or ""
-            
+            role = user.get("role", "student")
+
             if not email: continue
+            # Skip professors from student list
+            if role == "professor": continue
+            # If professor is authenticated, only show their groups
+            if prof_groups and group not in prof_groups: continue
             
             user_activities = [a for a in all_activities if a.get("user_email") == email]
             user_activities.sort(key=lambda x: x.get("timestamp", "") or "", reverse=True)
@@ -2227,11 +2266,12 @@ def assign_homework():
         
         elif student_id.startswith("group:"):
             group_name = student_id.replace("group:", "")
-            students = query_database(USERS_DB_ID)
-            count = 0
+            students   = query_database(USERS_DB_ID)
+            count      = 0
             for s in students:
                 student_group = s.get("group") or s.get("Group") or ""
-                if s.get("Email") and student_group == group_name:
+                role          = s.get("role", "student")
+                if s.get("Email") and student_group == group_name and role == "student":
                     create_page_in_database(HOMEWORK_DB_ID, build_props(s["Email"]))
                     count += 1
             if count == 0:
@@ -2414,25 +2454,43 @@ def get_students_list():
     try:
         users = query_database(USERS_DB_ID)
         students = []
-        groups = set()
-        
+        groups   = set()
+
+        # Get professor's groups from token
+        prof_groups = []
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header:
+            try:
+                token = auth_header.replace("Bearer ", "")
+                payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=["HS256"])
+                if payload.get("role") == "professor":
+                    prof_groups = get_professor_groups(payload.get("group", ""))
+            except Exception:
+                pass
+
         for u in users:
-            if u.get("Email"):
-                group = u.get("group") or u.get("Group") or ""
-                students.append({
-                    "id": u.get("Email"),
-                    "name": u.get("Name"),
-                    "email": u.get("Email"),
-                    "group": group
-                })
-                if group:
-                    groups.add(group)
-        
+            email = u.get("Email", "")
+            group = u.get("group") or u.get("Group") or ""
+            role  = u.get("role", "student")
+
+            if not email: continue
+            if role == "professor": continue                          # excluir profesores
+            if prof_groups and group not in prof_groups: continue    # solo grupos del profesor
+
+            students.append({
+                "id":    email,
+                "name":  u.get("Name", ""),
+                "email": email,
+                "group": group,
+            })
+            if group:
+                groups.add(group)
+
         return jsonify({
             "students": students,
-            "groups": sorted(list(groups))
+            "groups":   sorted(list(groups)),
         })
-    except Exception as e: 
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ============================================================================

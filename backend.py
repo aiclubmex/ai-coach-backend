@@ -2830,71 +2830,120 @@ def get_student_homework_for_professor():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# MOCK EXAM ENDPOINTS
+# MOCK EXAM ENDPOINTS — v2 (IB 2025 topics + multi-theme + Paper filter)
 # ==========================================
+
+# Syllabus 2025 exclusions
+SYLLABUS_EXCLUDE_RE = re.compile(r'capacitor|capacitance|transformer', re.IGNORECASE)
+
+def extract_ib_topic(p: dict) -> str:
+    """Extract IB 2025 topic code (A.1-E.5) from a Notion problem record."""
+    raw = p.get("topic") or p.get("Topic") or ""
+    # multi_select comes as list from query_database
+    if isinstance(raw, list):
+        raw = raw[0] if raw else ""
+    raw = str(raw).strip()
+    if re.match(r"^[A-E]\.[1-5]$", raw):
+        return raw
+    # Fallback: infer from key_concepts
+    kc = p.get("key_concepts") or p.get("Key Concepts") or ""
+    if isinstance(kc, list):
+        kc = kc[0] if kc else ""
+    return ""  # caller handles inference
+
+def extract_paper_from_ref(ref: str) -> str:
+    """Extract P1 or P2 from reference string like 2018-Z1-P2-Q3-A."""
+    m = re.search(r"-(P[123])-", ref or "", re.IGNORECASE)
+    return m.group(1).upper() if m else ""
+
+def is_excluded(p: dict) -> bool:
+    """Returns True if problem should be excluded (Capacitors/Transformers)."""
+    text = f"{p.get('name','')} {p.get('key_concepts','')}"
+    return bool(SYLLABUS_EXCLUDE_RE.search(text))
+
 @app.route("/api/mock/available-topics", methods=["GET"])
 @require_auth
 def mock_available_topics():
     """
-    Returns all available topics with problem counts and total marks.
-    Used by the mock exam landing page to show topic selection.
+    Returns IB 2025 topics (A.1-E.5) with problem counts.
+    Excludes Capacitors/Transformers automatically.
     """
     user = request.user
     email = user.get("email", "")
-    
     try:
         all_problems = query_database(NOTION_DB_ID, max_pages=5)
-        
-        # Get student activity to know what's solved
+
         solved_well = set()
         activities = query_database(
             ACTIVITY_DB_ID,
             filter_obj={"property": "user_email", "email": {"equals": email}},
             sorts=[{"property": "timestamp", "direction": "descending"}]
         ) if ACTIVITY_DB_ID else []
-        
+
         for act in activities:
             if act.get("action") == "completed":
                 score = act.get("score", 0) or 0
                 ref = act.get("problem_reference") or act.get("problem_name", "")
-                if score >= 85:
+                if score >= 85 and ref:
                     solved_well.add(ref)
-        
-        # Group problems by topic
+
+        # IB_THEMES structure for response
+        IB_THEMES_META = {
+            "A": "Space, Time & Motion",
+            "B": "Particulate Nature of Matter",
+            "C": "Wave Behaviour",
+            "D": "Fields",
+            "E": "Nuclear & Quantum Physics"
+        }
+
         topics = {}
         for p in all_problems:
-            kc = p.get("key_concepts") or p.get("Key Concepts") or ""
-            if isinstance(kc, list):
-                kc = kc[0] if kc else ""
-            topic = kc.split(";")[0].strip() if kc else ""
-            if not topic:
-                continue
-            
-            ref = p.get("reference") or p.get("Reference") or p.get("Name") or p.get("name") or ""
-            marks = p.get("marks") or p.get("Marks") or 4
-            try:
-                marks = int(marks)
-            except:
-                marks = 4
-            
-            if topic not in topics:
-                topics[topic] = {"topic": topic, "total_problems": 0, "total_marks": 0, "unsolved": 0, "unsolved_marks": 0}
-            
-            topics[topic]["total_problems"] += 1
-            topics[topic]["total_marks"] += marks
-            
+            if is_excluded(p): continue
+            ib_topic = extract_ib_topic(p)
+            if not ib_topic: continue
+
+            ref = p.get("problem_reference") or p.get("reference") or p.get("name") or ""
+            paper = p.get("paper") or extract_paper_from_ref(ref)
+            marks = p.get("marks") or p.get("Marks") or 0
+            try: marks = int(marks)
+            except: marks = 0
+
+            if ib_topic not in topics:
+                theme = ib_topic[0]
+                topics[ib_topic] = {
+                    "topic": ib_topic,
+                    "theme": theme,
+                    "theme_name": IB_THEMES_META.get(theme, ""),
+                    "total_problems": 0, "total_marks": 0,
+                    "p1_count": 0, "p2_count": 0,
+                    "unsolved": 0, "unsolved_marks": 0
+                }
+
+            topics[ib_topic]["total_problems"] += 1
+            topics[ib_topic]["total_marks"] += marks
+            if paper == "P1": topics[ib_topic]["p1_count"] += 1
+            if paper == "P2": topics[ib_topic]["p2_count"] += 1
             if ref not in solved_well:
-                topics[topic]["unsolved"] += 1
-                topics[topic]["unsolved_marks"] += marks
-        
-        topic_list = sorted(topics.values(), key=lambda t: t["total_marks"], reverse=True)
-        
+                topics[ib_topic]["unsolved"] += 1
+                topics[ib_topic]["unsolved_marks"] += marks
+
+        topic_list = sorted(topics.values(), key=lambda t: t["topic"])
+
+        # Group by theme for frontend
+        themes = {}
+        for t in topic_list:
+            th = t["theme"]
+            if th not in themes:
+                themes[th] = {"theme": th, "name": IB_THEMES_META.get(th,""), "subtopics": [], "total_problems": 0}
+            themes[th]["subtopics"].append(t)
+            themes[th]["total_problems"] += t["total_problems"]
+
         return jsonify({
             "topics": topic_list,
-            "total_problems": len(all_problems),
+            "themes": list(themes.values()),
+            "total_problems": sum(t["total_problems"] for t in topic_list),
             "total_marks": sum(t["total_marks"] for t in topic_list)
         })
-        
     except Exception as e:
         print(f"Error in available-topics: {e}")
         return jsonify({"error": str(e)}), 500
@@ -2904,37 +2953,43 @@ def mock_available_topics():
 @require_auth
 def mock_build():
     """
-    Build a mock exam by selecting real problems from the Notion database.
-    
+    Build a mock exam from real Notion problems.
+
     Input JSON:
-    - type: "topic" | "final"
-    - topic: string (required if type=topic)
-    - target_marks: int (default 25 for topic, 90 for final)
-    
-    Returns selected problems with full details.
+    - type: "topic" | "themes" | "final"
+    - topic: "A.3" (single topic, for type=topic)
+    - themes: ["A","B","C"] (list of theme letters, for type=themes)
+    - paper: "P1" | "P2" | "" (optional paper filter)
+    - target_problems: int (number of problems, default 30)
+    - target_marks: int (alternative to target_problems, default None)
+
+    Professor use case: type=themes, themes=["A","B","C"], paper="P1", target_problems=30
     """
     user = request.user
     email = user.get("email", "")
     data = request.get_json(force=True) if request.data else {}
-    
-    mock_type = data.get("type", "topic")
-    target_topic = data.get("topic", "")
-    target_marks = data.get("target_marks", 25 if mock_type == "topic" else 90)
-    
+
+    mock_type     = data.get("type", "themes")
+    target_topic  = data.get("topic", "")
+    target_themes = data.get("themes", [])   # ["A","B","C"]
+    paper_filter  = (data.get("paper") or "").upper().strip()  # "P1" | "P2" | ""
+    target_probs  = data.get("target_problems", 30)
+    target_marks  = data.get("target_marks", None)
+
     try:
         import random as rand_mod
-        
+
         all_problems = query_database(NOTION_DB_ID, max_pages=5)
-        
-        # Get student activity
+
+        # Get activity
         solved_well = set()
-        solved_any = {}
+        solved_any  = {}
         activities = query_database(
             ACTIVITY_DB_ID,
             filter_obj={"property": "user_email", "email": {"equals": email}},
             sorts=[{"property": "timestamp", "direction": "descending"}]
         ) if ACTIVITY_DB_ID else []
-        
+
         for act in activities:
             if act.get("action") == "completed":
                 score = act.get("score", 0) or 0
@@ -2944,156 +2999,161 @@ def mock_build():
                         solved_any[ref] = score
                     if score >= 85:
                         solved_well.add(ref)
-        
-        # Parse problems with topic info
+
+        # Parse & filter problems
         parsed = []
         for p in all_problems:
-            kc = p.get("key_concepts") or p.get("Key Concepts") or ""
-            if isinstance(kc, list):
-                kc = kc[0] if kc else ""
-            topic = kc.split(";")[0].strip() if kc else ""
-            if not topic:
+            if is_excluded(p): continue
+
+            ib_topic = extract_ib_topic(p)
+            if not ib_topic: continue
+
+            ref   = p.get("problem_reference") or p.get("reference") or p.get("name") or ""
+            paper = (p.get("paper") or extract_paper_from_ref(ref)).upper()
+            name  = p.get("Name") or p.get("name") or ""
+            marks = p.get("marks") or p.get("Marks") or 0
+            try: marks = int(marks)
+            except: marks = 0
+
+            # Paper filter
+            if paper_filter and paper != paper_filter:
                 continue
-            
-            pid = p.get("id", "")
-            ref = p.get("reference") or p.get("Reference") or p.get("Name") or p.get("name") or ""
-            name = p.get("Name") or p.get("name") or ""
-            marks = p.get("marks") or p.get("Marks") or 4
-            try:
-                marks = int(marks)
-            except:
-                marks = 4
-            
+
             parsed.append({
-                "id": pid,
+                "id": p.get("id",""),
                 "reference": ref,
                 "name": name,
-                "topic": topic,
+                "ib_topic": ib_topic,
+                "theme": ib_topic[0],
+                "paper": paper,
                 "marks": marks,
                 "solved_well": ref in solved_well,
                 "best_score": solved_any.get(ref, 0)
             })
-        
-        # SELECT PROBLEMS based on mock type
-        selected_ids = []
-        
+
+        if not parsed:
+            return jsonify({"error": "No problems found with the selected filters"}), 404
+
+        # ── SELECTION LOGIC ──────────────────────────────────────────────
+        selected = []
+
         if mock_type == "topic":
-            topic_problems = [p for p in parsed if target_topic.lower() in p["topic"].lower() or p["topic"].lower() in target_topic.lower()]
-            
-            if not topic_problems:
-                return jsonify({"error": f"No problems found for topic: {target_topic}"}), 404
-            
-            # Sort: unsolved first, then by marks descending
-            topic_problems.sort(key=lambda p: (p["solved_well"], -p["marks"]))
-            
-            total = 0
-            for p in topic_problems:
-                if total >= target_marks:
-                    break
-                selected_ids.append(p["id"])
-                total += p["marks"]
-        
-        elif mock_type == "final":
-            # Distribute across all topics proportionally to reach ~90 marks
-            by_topic = {}
-            for p in parsed:
-                if p["topic"] not in by_topic:
-                    by_topic[p["topic"]] = []
-                by_topic[p["topic"]].append(p)
-            
-            total_available = sum(sum(pp["marks"] for pp in probs) for probs in by_topic.values())
-            if total_available == 0:
-                return jsonify({"error": "No problems available"}), 404
-            
-            # Calculate proportional marks per topic
-            topic_targets = {}
-            for t, probs in by_topic.items():
-                topic_marks = sum(pp["marks"] for pp in probs)
-                topic_targets[t] = max(4, round(target_marks * (topic_marks / total_available)))
-            
-            # Normalize
-            total_target = sum(topic_targets.values())
-            if total_target > 0:
-                scale = target_marks / total_target
-                topic_targets = {t: max(4, round(m * scale)) for t, m in topic_targets.items()}
-            
-            total = 0
-            for topic, probs in by_topic.items():
-                t_target = topic_targets.get(topic, 10)
-                unsolved = [p for p in probs if not p["solved_well"]]
-                solved = [p for p in probs if p["solved_well"]]
-                rand_mod.shuffle(unsolved)
-                rand_mod.shuffle(solved)
-                pool = unsolved + solved
-                
-                t_total = 0
+            # Single subtopic (A.3, E.5, etc.)
+            pool = [p for p in parsed if p["ib_topic"] == target_topic]
+            if not pool:
+                return jsonify({"error": f"No problems found for topic {target_topic}"}), 404
+            pool.sort(key=lambda p: (p["solved_well"], -p["marks"]))
+            if target_marks:
+                total = 0
                 for p in pool:
-                    if t_total >= t_target:
-                        break
-                    selected_ids.append(p["id"])
-                    t_total += p["marks"]
-                    total += p["marks"]
-            
-            rand_mod.shuffle(selected_ids)
-        
-        if not selected_ids:
-            return jsonify({"error": "Could not select problems"}), 404
-        
-        # Fetch full details for each selected problem
+                    if total >= target_marks: break
+                    selected.append(p); total += p["marks"]
+            else:
+                selected = pool[:target_probs]
+
+        elif mock_type == "themes":
+            # Multiple themes (professor use case: A+B+C, Paper 1, 30 problems)
+            if not target_themes:
+                return jsonify({"error": "themes list required for type=themes"}), 400
+            pool = [p for p in parsed if p["theme"] in target_themes]
+            if not pool:
+                return jsonify({"error": f"No problems found for themes {target_themes}"}), 404
+
+            if target_marks:
+                # Fill by marks
+                pool.sort(key=lambda p: (p["solved_well"], -p["marks"]))
+                total = 0
+                for p in pool:
+                    if total >= target_marks: break
+                    selected.append(p); total += p["marks"]
+            else:
+                # Distribute evenly across themes
+                by_theme = {}
+                for p in pool:
+                    by_theme.setdefault(p["theme"], []).append(p)
+                per_theme = max(1, target_probs // len(by_theme))
+                for theme, probs in by_theme.items():
+                    probs.sort(key=lambda p: (p["solved_well"], -p["marks"]))
+                    selected.extend(probs[:per_theme])
+                # Top up to target
+                used_ids = {p["id"] for p in selected}
+                remaining = [p for p in pool if p["id"] not in used_ids]
+                rand_mod.shuffle(remaining)
+                needed = target_probs - len(selected)
+                selected.extend(remaining[:needed])
+            rand_mod.shuffle(selected)
+
+        elif mock_type == "final":
+            # Full exam across all themes proportionally
+            by_theme = {}
+            for p in parsed:
+                by_theme.setdefault(p["theme"], []).append(p)
+            per_theme = max(1, target_probs // max(1, len(by_theme)))
+            for theme, probs in by_theme.items():
+                probs.sort(key=lambda p: (p["solved_well"], -p["marks"]))
+                selected.extend(probs[:per_theme])
+            rand_mod.shuffle(selected)
+            selected = selected[:target_probs]
+
+        if not selected:
+            return jsonify({"error": "Could not select problems with these filters"}), 404
+
+        # Fetch full details
         problems = []
-        for pid in selected_ids:
+        for sp in selected:
             try:
-                full = fetch_page(pid)
-                kc = full.get("key_concepts") or full.get("Key Concepts") or ""
-                if isinstance(kc, list):
-                    kc = kc[0] if kc else ""
-                topic = kc.split(";")[0].strip() if kc else ""
-                
-                marks = full.get("marks") or full.get("Marks") or 4
-                try:
-                    marks = int(marks)
-                except:
-                    marks = 4
-                
+                full = fetch_page(sp["id"])
+                ib_topic = extract_ib_topic(full) or sp["ib_topic"]
+                marks = sp["marks"] or 0
+
                 problems.append({
                     "name": full.get("Name") or full.get("name") or "",
-                    "problem_statement": full.get("problem_statement") or full.get("Problem Statement") or "",
-                    "given_values": full.get("given_values") or full.get("Given Values") or "",
-                    "find": full.get("find") or full.get("Find") or "",
+                    "problem_statement": full.get("problem_statement") or "",
+                    "given_values": full.get("given_values") or "",
+                    "find": full.get("find") or "",
                     "marks": marks,
-                    "key_concept": topic,
-                    "full_solution": full.get("full_solution") or full.get("Full Solution") or full.get("step_by_step") or "",
-                    "final_answer": full.get("final_answer") or full.get("Final Answer") or "",
-                    "topic": topic,
+                    "ib_topic": ib_topic,
+                    "topic": ib_topic,
+                    "paper": sp["paper"],
+                    "key_concept": ib_topic,
+                    "full_solution": full.get("full_solution") or full.get("step_by_step") or "",
+                    "final_answer": full.get("final_answer") or "",
                     "source": "real",
-                    "problem_id": pid,
-                    "problem_reference": full.get("problem_reference") or full.get("reference") or full.get("Reference") or full.get("Name") or full.get("name") or "",
-                    "pdf_page_number": full.get("pdf_page_number") or full.get("Pdf_page_number") or None
+                    "problem_id": sp["id"],
+                    "problem_reference": sp["reference"],
+                    "pdf_page_number": full.get("pdf_page_number") or None,
+                    "oxford_reference": get_oxford_reference(ib_topic)
                 })
             except Exception as e:
-                print(f"Error fetching problem {pid}: {e}")
+                print(f"Error fetching {sp['id']}: {e}")
                 continue
-        
+
         if not problems:
             return jsonify({"error": "Could not fetch problem details"}), 500
-        
-        topics_covered = list(set(p["topic"] for p in problems))
-        total_marks = sum(p["marks"] for p in problems)
-        
+
+        topics_covered = list(set(p["ib_topic"] for p in problems))
+        p1_count = sum(1 for p in problems if p["paper"] == "P1")
+        p2_count = sum(1 for p in problems if p["paper"] == "P2")
+
         return jsonify({
             "problems": problems,
-            "total_marks": total_marks,
-            "topics_covered": topics_covered,
+            "total_marks": sum(p["marks"] for p in problems),
+            "num_problems": len(problems),
+            "topics_covered": sorted(topics_covered),
             "mock_type": mock_type,
-            "target_topic": target_topic if mock_type == "topic" else None,
-            "num_problems": len(problems)
+            "paper_filter": paper_filter or "all",
+            "p1_count": p1_count,
+            "p2_count": p2_count,
+            "themes_requested": target_themes if mock_type == "themes" else None,
+            "target_topic": target_topic if mock_type == "topic" else None
         })
-        
+
     except Exception as e:
         print(f"Error building mock: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/mock/create-weakness", methods=["POST"])
 @require_auth
 def create_weakness_mock():

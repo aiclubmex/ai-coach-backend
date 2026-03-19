@@ -41,6 +41,56 @@ RESOURCES_DB_ID     = os.environ.get("RESOURCES_DB_ID", "")  # Resources by Topi
 JWT_SECRET_KEY      = os.environ.get("JWT_SECRET_KEY", "change-this-secret-key-in-production")
 
 # ==============================
+# Oxford Physics 2023 — Deep Link Reference Map
+# Maps IB 2025 topic codes → Oxford section + page range
+# Used to give students precise page references when they make errors
+# ==============================
+OXFORD_REFERENCES = {
+    "A.1": {"section": "Chapter 1 — Kinematics",            "pages": "2–35",   "data_booklet": "p.4 (kinematic equations)"},
+    "A.2": {"section": "Chapter 2 — Forces & Momentum",     "pages": "36–89",  "data_booklet": "p.4 (Newton's laws, momentum)"},
+    "A.3": {"section": "Chapter 3 — Work, Energy & Power",  "pages": "90–125", "data_booklet": "p.5 (energy equations)"},
+    "A.4": {"section": "Chapter 4 — Rigid Body Mechanics",  "pages": "126–161","data_booklet": "p.5 (rotational equations)"},
+    "A.5": {"section": "Chapter 5 — Special Relativity",    "pages": "162–195","data_booklet": "p.6 (Lorentz factor)"},
+    "B.1": {"section": "Chapter 8 — Thermal Energy",        "pages": "270–305","data_booklet": "p.6 (specific heat, latent heat)"},
+    "B.2": {"section": "Chapter 9 — Greenhouse Effect",     "pages": "306–325","data_booklet": "p.6 (Stefan-Boltzmann, Wien's law)"},
+    "B.3": {"section": "Chapter 10 — Gas Laws",             "pages": "326–355","data_booklet": "p.6 (ideal gas law, Boltzmann)"},
+    "B.4": {"section": "Chapter 11 — Thermodynamics",       "pages": "356–395","data_booklet": "p.6 (1st & 2nd law, entropy)"},
+    "B.5": {"section": "Chapter 7 — Electric Circuits",     "pages": "230–269","data_booklet": "p.5 (Ohm's law, power, Kirchhoff)"},
+    "C.1": {"section": "Chapter 12 — Simple Harmonic Motion","pages":"396–427","data_booklet": "p.7 (SHM equations)"},
+    "C.2": {"section": "Chapter 13 — Wave Model",           "pages": "428–457","data_booklet": "p.7 (wave speed, frequency)"},
+    "C.3": {"section": "Chapter 14 — Wave Phenomena",       "pages": "458–499","data_booklet": "p.7 (diffraction, single-slit, Rayleigh)"},
+    "C.4": {"section": "Chapter 15 — Standing Waves",       "pages": "500–527","data_booklet": "p.7 (harmonics, resonance)"},
+    "C.5": {"section": "Chapter 16 — Doppler Effect",       "pages": "528–545","data_booklet": "p.7 (Doppler equations)"},
+    "D.1": {"section": "Chapter 17 — Gravitational Fields", "pages": "546–585","data_booklet": "p.8 (gravitational potential, Kepler)"},
+    "D.2": {"section": "Chapter 18 — Electric & Magnetic Fields","pages":"586–635","data_booklet": "p.8 (Coulomb, magnetic force)"},
+    "D.3": {"section": "Chapter 19 — Motion in EM Fields",  "pages": "636–665","data_booklet": "p.9 (Lorentz force, cyclotron)"},
+    "D.4": {"section": "Chapter 20 — Electromagnetic Induction","pages":"666–703","data_booklet": "p.9 (Faraday, Lenz, flux linkage)"},
+    "E.1": {"section": "Chapter 21 — Atomic Structure",     "pages": "704–735","data_booklet": "p.9 (Bohr model, Rutherford)"},
+    "E.2": {"section": "Chapter 22 — Quantum Physics",      "pages": "736–771","data_booklet": "p.10 (Planck, de Broglie, photoelectric)"},
+    "E.3": {"section": "Chapter 23 — Radioactive Decay",    "pages": "772–809","data_booklet": "p.10 (decay constant, half-life, binding energy)"},
+    "E.4": {"section": "Chapter 24 — Nuclear Fission",      "pages": "810–833","data_booklet": "p.10 (fission, chain reaction)"},
+    "E.5": {"section": "Chapter 25 — Stellar Properties",   "pages": "834–875","data_booklet": "p.11 (HR diagram, stellar parallax, luminosity)"},
+}
+
+def get_oxford_reference(topic: str) -> str:
+    """Returns a formatted Oxford reference string for a given IB topic code."""
+    if not topic:
+        return ""
+    # Handle multi_select arrays stored as lists
+    if isinstance(topic, list):
+        topic = topic[0] if topic else ""
+    topic = str(topic).strip()
+    # Match exact code (A.1, B.4, etc.) or first two chars
+    ref = OXFORD_REFERENCES.get(topic) or OXFORD_REFERENCES.get(topic[:3] if len(topic) >= 3 else "")
+    if not ref:
+        return ""
+    return (
+        f"Oxford Physics 2023 Reference: {ref['section']}, pages {ref['pages']}. "
+        f"Data Booklet: {ref['data_booklet']}."
+    )
+
+
+# ==============================
 # Flask
 # ==============================
 app = Flask(__name__)
@@ -526,6 +576,16 @@ Compare the student's work against this reference solution.
         if attempt_number > 1:
             attempt_context = f"\nThis is the student's attempt #{attempt_number} at this problem. Be encouraging about improvement while still being precise about errors."
         
+        # Oxford Deep Link: get reference for this problem's topic
+        problem_topic = problem.get('topic', '')
+        oxford_ref = get_oxford_reference(problem_topic)
+        oxford_block = f"""
+OXFORD PHYSICS 2023 REFERENCE:
+{oxford_ref}
+When giving feedback on errors, reference the specific Oxford section and page above.
+If the student made a calculation error, also mention the relevant Data Booklet page.
+""" if oxford_ref else ""
+
         prompt = f"""You are an expert IB Physics HL examiner evaluating a student's solution.
 {attempt_context}
 
@@ -537,7 +597,7 @@ What to find: {problem.get('find', '')}
 Topic: {problem.get('topic', '')}
 {marks_context}
 {solution_reference}
-
+{oxford_block}
 STUDENT'S SOLUTION:
 {solution_text}
 {"" if not has_image else "The student has also attached a PHOTO of their handwritten solution. Read and evaluate the handwritten work in the image carefully. The image contains their actual work — evaluate what you see in the photo."}
@@ -550,10 +610,11 @@ EVALUATE and respond with ONLY a valid JSON object (no markdown, no backticks):
   "correct": <true if score >= 70, false otherwise>,
   "marks_awarded": <number of IB marks earned out of {marks or 'total'}>,
   "marks_total": {marks or 'null'},
-  "feedback": "<detailed feedback: start with what the student did well, then explain specific errors>",
+  "feedback": "<detailed feedback: start with what the student did well, then explain errors. If the student made mistakes, end with: 'Para reforzar este tema, revisa [Oxford section] páginas [X-Y].'>",
   "error_type": "<classify the main error: 'conceptual' | 'calculation' | 'units' | 'method' | 'incomplete' | 'none'>",
   "missing_steps": "<list any key steps or concepts the student missed>",
   "key_concept": "<the most important physics concept tested in this problem>",
+  "oxford_reference": "{oxford_ref}",
   "time_taken": "{time_spent // 60}:{time_spent % 60:02d}"
 }}
 """

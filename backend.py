@@ -2829,6 +2829,65 @@ def get_student_homework_for_professor():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+# ========================================
+# STUDENT PROGRESS (for Study Plan Tracker)
+# ========================================
+
+@app.get("/api/professor/student-progress")
+def professor_student_progress():
+    """
+    Get a specific student's completed problems for the Study Plan Tracker.
+    Professors/parents can view any student's progress.
+
+    Query params:
+      - email (required): student email
+
+    Returns: { completed_references: ["2022-Z1-P1-Q2", ...], total_completed, avg_score, total_time_minutes }
+    """
+    if not ACTIVITY_DB_ID:
+        return jsonify({"error": "ACTIVITY_DB_ID not configured"}), 500
+
+    student_email = request.args.get("email", "").strip()
+    if not student_email:
+        return jsonify({"error": "Email parameter required"}), 400
+
+    try:
+        activities = query_database(
+            ACTIVITY_DB_ID,
+            filter_obj={"property": "user_email", "email": {"equals": student_email}},
+            sorts=[{"property": "timestamp", "direction": "descending"}],
+            max_pages=10
+        )
+
+        completed_refs = set()
+        scores = []
+        total_time = 0
+
+        for act in activities:
+            action = act.get("action", "")
+            if action == "completed":
+                ref = act.get("problem_reference") or act.get("problem_name", "")
+                if ref:
+                    completed_refs.add(ref)
+                score = act.get("score", 0) or 0
+                if score > 0:
+                    scores.append(score)
+                total_time += act.get("time_spent_seconds", 0) or 0
+
+        return jsonify({
+            "student_email": student_email,
+            "completed_references": sorted(list(completed_refs)),
+            "total_completed": len(completed_refs),
+            "average_score": round(sum(scores) / len(scores), 1) if scores else 0,
+            "total_time_minutes": total_time // 60
+        }), 200
+
+    except Exception as e:
+        print(f"[ERROR] professor/student-progress: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # ==========================================
 # MOCK EXAM ENDPOINTS — v2 (IB 2025 topics + multi-theme + Paper filter)
 # ==========================================

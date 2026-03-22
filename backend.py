@@ -393,13 +393,53 @@ def call_anthropic_vision(prompt: str, image_base64: str, media_type: str = "ima
 
 def generate_steps_with_llm(problem: Dict[str, Any]) -> List[Dict[str, str]]:
     title = problem.get("title") or problem.get("name", "")
-    prompt = f"Create a clear 4-6 step solution plan for this problem: {title}\nStatement: {problem.get('statement', '')}\nFormat: Numbered lines only."
+    statement = problem.get("problem_statement", "") or problem.get("statement", "")
+    given = problem.get("given_values", "")
+    find = problem.get("find", "")
+    solution = problem.get("full_solution", "") or problem.get("step_by_step", "") or problem.get("final_answer", "")
+    marks = problem.get("marks", "")
+
+    prompt = f"""Break down this IB Physics HL problem into clear, specific steps that guide a student to the solution.
+Each step must reference the ACTUAL values and equations from this specific problem.
+
+Problem: {title}
+Statement: {statement}
+Given values: {given}
+What to find: {find}
+Marks: {marks}
+{('Reference solution: ' + solution) if solution else ''}
+
+Write 4-8 numbered steps. Each step should:
+- Tell the student exactly what to calculate or identify
+- Reference specific values from the problem (not generic placeholders)
+- Include the relevant equation or principle
+
+Format: One numbered step per line. No JSON, no markdown, just plain numbered lines.
+Example:
+1. Identify the given values: mass m = 2.5 kg, velocity v = 3.0 m/s
+2. Apply the kinetic energy formula: Ek = ½mv²
+3. Calculate: Ek = ½(2.5)(3.0)² = 11.25 J
+"""
     try:
-        text = call_anthropic_api(prompt, max_tokens=512)
+        if not ANTHROPIC_API_KEY:
+            return [{"id": "1", "description": "Identify the given values from the problem.", "rubric": ""}]
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "temperature": 0,
+            "system": "You are an expert IB Physics HL tutor. Generate clear, specific solution steps. Respond with numbered lines only — no JSON, no markdown code blocks, no backticks.",
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+        text = resp.json().get("content", [])[0].get("text", "")
         steps = parse_steps(text)
-        return steps if steps else [{"id": "1", "description": "Analyze the problem statement.", "rubric": ""}]
-    except:
-        return [{"id": "1", "description": "Identify given data.", "rubric": ""}]
+        return steps if steps else [{"id": "1", "description": "Analyze the problem statement and identify given values.", "rubric": ""}]
+    except Exception as e:
+        print(f"[WARNING] generate_steps_with_llm failed: {e}")
+        return [{"id": "1", "description": "Identify the given data and what you need to find.", "rubric": ""}]
 
 def require_auth(f):
     @wraps(f)
@@ -532,6 +572,52 @@ def submit_solution():
         problem = fetch_page(problem_id)
         print(f"[SUBMIT] Problem loaded: name='{problem.get('name','')}', ref='{problem.get('problem_reference','')}', statement='{(problem.get('problem_statement','') or '')[:80]}'...")
         
+        # ── STEP CHECK MODE ──────────────────────────────────────
+        # When the student is in step-by-step guided mode, evaluate only this step
+        step_check = data.get("step_check", False)
+        step_expected = data.get("step_expected", "")
+        if step_check and step_expected:
+            step_prompt = f"""You are an expert IB Physics HL tutor helping a student work through a problem step by step.
+
+PROBLEM: {problem.get('name', '')}
+Statement: {problem.get('problem_statement', '')}
+Given values: {problem.get('given_values', '')}
+
+CURRENT STEP (what the student should do):
+{step_expected}
+
+STUDENT'S REASONING FOR THIS STEP:
+{solution_text}
+
+Evaluate ONLY whether the student's reasoning correctly addresses this specific step.
+Do NOT evaluate the entire problem — just this one step.
+
+Respond with ONLY valid JSON (no markdown, no backticks):
+{{
+  "score": <0-100 for this step only>,
+  "feedback": "<2-3 sentences: what they got right, what to fix, a specific hint if wrong>"
+}}"""
+            try:
+                if ANTHROPIC_API_KEY:
+                    step_response = call_anthropic_api(step_prompt, max_tokens=500)
+                    clean = step_response.strip()
+                    if clean.startswith('```'): clean = '\n'.join(clean.split('\n')[1:-1])
+                    step_result = json.loads(clean)
+                    return jsonify({
+                        "score": step_result.get("score", 50),
+                        "feedback": step_result.get("feedback", "Step evaluated."),
+                        "step_check": True
+                    }), 200
+            except Exception as se:
+                print(f"[WARNING] Step check failed, falling back: {se}")
+            # Fallback: just return the expected step content
+            return jsonify({
+                "score": 50,
+                "feedback": f"Compare your reasoning with the expected approach for this step.",
+                "step_check": True
+            }), 200
+        
+        # ── FULL SOLUTION EVALUATION ─────────────────────────────
         # --- QUICK WIN 3: Count previous attempts ---
         problem_ref = problem.get("problem_reference", "")
         attempt_number = count_previous_attempts(user_email, problem_ref) + 1

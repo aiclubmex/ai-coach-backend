@@ -574,10 +574,11 @@ THE STEP THEY'RE STUCK ON:
 
 Give a HINT that helps them think through this step WITHOUT giving the answer directly.
 Your hint should:
-- Point them to the right physics concept or equation
-- Ask a guiding question that leads to the answer
-- Reference specific values from the problem they should use
-- Be encouraging and supportive
+- Ask a guiding QUESTION that leads the student to think (not tell them the answer)
+- Name the relevant physics concept but ask THEM to recall the equation
+- Reference specific values from the problem they should look at
+- Be encouraging — "Think about..." or "What happens when..." style
+- NEVER state the equation or calculation directly — make them think
 
 Keep your hint to 2-3 sentences maximum. Be specific to THIS problem, not generic.
 
@@ -603,6 +604,100 @@ Respond with ONLY valid JSON (no markdown, no backticks):
     except Exception as e:
         print(f"[ERROR] step-hint: {e}")
         return jsonify({"hint": "Try to identify which physics equation connects the values given in this step.", "concept": ""}), 200
+
+
+# ========================================
+# AI COACH GUIDE — Socratic conversational tutor
+# ========================================
+@app.post("/api/coach-guide")
+def coach_guide():
+    """
+    Socratic tutoring: Claude guides the student through the problem with questions,
+    never giving the answer directly. Uses the official solution as hidden reference.
+    
+    Receives: problem_id, conversation (array of {role: 'coach'|'student', text})
+    Returns: {message, is_complete, progress}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    problem_id = data.get("problem_id", "")
+    conversation = data.get("conversation", [])
+    
+    if not problem_id:
+        return jsonify({"error": "Missing problem_id"}), 400
+    
+    try:
+        problem = fetch_page(problem_id)
+        
+        # Get the official solution (HIDDEN from student — only Claude sees it)
+        official_solution = problem.get("full_solution", "") or problem.get("step_by_step", "") or problem.get("final_answer", "")
+        
+        # Build conversation history for Claude
+        conv_text = ""
+        for turn in conversation:
+            role_label = "TUTOR" if turn.get("role") == "coach" else "STUDENT"
+            conv_text += f"\n{role_label}: {turn.get('text', '')}"
+        
+        turn_number = len([t for t in conversation if t.get("role") == "student"]) + 1
+        
+        coach_prompt = f"""You are an expert IB Physics HL tutor using the Socratic method. 
+Your job is to guide the student to discover the answer through questions — NEVER give the answer directly.
+
+PROBLEM (student can see this):
+Name: {problem.get('name', '')}
+Statement: {problem.get('problem_statement', '')}
+Given values: {problem.get('given_values', '')}
+What to find: {problem.get('find', '')}
+Topic: {problem.get('topic', '')}
+Marks: {problem.get('marks', '')}
+
+OFFICIAL SOLUTION (HIDDEN — only you can see this, NEVER reveal it):
+{official_solution}
+
+CONVERSATION SO FAR:{conv_text if conv_text else " (This is the start of the conversation)"}
+
+RULES:
+1. Ask ONE question at a time that guides the student toward the next logical step
+2. If the student answers correctly, confirm briefly ("✅ Exactly!") then ask the next guiding question
+3. If the student answers incorrectly, say what's not quite right and rephrase the question with a smaller hint
+4. If the student says "I don't know", give a more specific hint (mention the relevant concept/equation name) but still ask THEM to apply it
+5. NEVER state the final answer — guide them to say it themselves
+6. Use the actual values from this specific problem, not generic examples
+7. When the student has worked through all the steps and reached the correct answer, congratulate them and summarize what they learned
+8. Keep each response to 2-4 sentences maximum
+9. This is turn {turn_number} — {"start by asking what information the problem gives them" if turn_number == 1 else "continue from where the conversation left off"}
+
+Respond with ONLY valid JSON (no markdown, no backticks):
+{{
+  "message": "<your Socratic question or response — use ✅ or 💭 emoji to indicate if their answer was right/wrong>",
+  "is_complete": <true if the student has successfully reached the final answer, false otherwise>,
+  "progress": "<brief label: 'Identifying given values' or 'Applying the equation' or 'Calculating' or 'Checking answer' etc>"
+}}"""
+
+        if not ANTHROPIC_API_KEY:
+            return jsonify({
+                "message": "What values does the problem give you? Start by identifying all the given information.",
+                "is_complete": False,
+                "progress": "Starting"
+            }), 200
+        
+        response_text = call_anthropic_api(coach_prompt, max_tokens=500)
+        clean = response_text.strip()
+        if clean.startswith('```'): clean = '\n'.join(clean.split('\n')[1:-1])
+        result = json.loads(clean)
+        
+        return jsonify({
+            "message": result.get("message", "What information does the problem give you?"),
+            "is_complete": result.get("is_complete", False),
+            "progress": result.get("progress", "")
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] coach-guide: {e}")
+        return jsonify({
+            "message": "Let's start with the basics — what values does the problem give you? What are you asked to find?",
+            "is_complete": False,
+            "progress": "Starting"
+        }), 200
 
 
 @app.get("/steps/<problem_id>")

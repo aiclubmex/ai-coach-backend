@@ -902,7 +902,7 @@ EVALUATE and respond with ONLY a valid JSON object (no markdown, no backticks):
   "correct": <true if score >= 70, false otherwise>,
   "marks_awarded": <number of IB marks earned out of {marks or 'total'}>,
   "marks_total": {marks or 'null'},
-  "feedback": "<detailed feedback: start with what the student did well, then explain errors. If the student made mistakes, end with: 'Para reforzar este tema, revisa [Oxford section] páginas [X-Y].'>",
+  "feedback": "<detailed feedback: start with what the student did well, then explain errors. If the student made mistakes, end with: 'To review this topic, see [Oxford section] pages [X-Y].'>",
   "error_type": "<classify the main error: 'conceptual' | 'calculation' | 'units' | 'method' | 'incomplete' | 'none'>",
   "missing_steps": "<list any key steps or concepts the student missed>",
   "key_concept": "<the most important physics concept tested in this problem>",

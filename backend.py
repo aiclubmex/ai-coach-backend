@@ -494,6 +494,117 @@ def get_problem(problem_id: str):
     try: return jsonify({"problem": fetch_page(problem_id)})
     except Exception as e: return jsonify({"error": str(e)}), 500
 
+
+# ========================================
+# FAST PROBLEM LOOKUP BY REFERENCE (for Study Plan)
+# ========================================
+@app.get("/api/problem-by-ref")
+def problem_by_ref():
+    """
+    Fast lookup: find a problem by its problem_reference field.
+    Used by Study Plan Tracker to load a specific problem without fetching all 497.
+    Returns the full problem data ready for the chatbot.
+    """
+    ref = request.args.get("ref", "").strip()
+    if not ref:
+        return jsonify({"error": "ref parameter required"}), 400
+    
+    try:
+        # Search Notion for this specific reference
+        results = query_database(
+            NOTION_DB_ID,
+            filter_obj={"property": "problem_reference", "rich_text": {"equals": ref}},
+            max_pages=1
+        )
+        if results:
+            # Fetch full page data
+            page = fetch_page(results[0]["id"])
+            return jsonify({"problem": page}), 200
+        
+        # Fallback: try partial match (e.g., ref might have slight format differences)
+        results = query_database(
+            NOTION_DB_ID,
+            filter_obj={"property": "problem_reference", "rich_text": {"contains": ref}},
+            max_pages=1
+        )
+        if results:
+            page = fetch_page(results[0]["id"])
+            return jsonify({"problem": page}), 200
+        
+        return jsonify({"error": f"Problem with reference '{ref}' not found"}), 404
+    except Exception as e:
+        print(f"[ERROR] problem-by-ref: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ========================================
+# STEP HINT — Claude gives a pedagogical hint for current step
+# ========================================
+@app.post("/api/step-hint")
+def step_hint():
+    """
+    Give a hint for the current step without revealing the answer.
+    Used in step-by-step mode when student is stuck.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    problem_id = data.get("problem_id", "")
+    step_text = data.get("step_text", "")
+    step_number = data.get("step_number", 1)
+    total_steps = data.get("total_steps", 1)
+    student_attempt = data.get("student_attempt", "")
+    
+    if not problem_id or not step_text:
+        return jsonify({"error": "Missing problem_id or step_text"}), 400
+    
+    try:
+        problem = fetch_page(problem_id)
+        
+        hint_prompt = f"""You are an expert IB Physics HL tutor. A student is stuck on step {step_number} of {total_steps} while solving a problem.
+
+PROBLEM: {problem.get('name', '')}
+Statement: {problem.get('problem_statement', '')}
+Given values: {problem.get('given_values', '')}
+What to find: {problem.get('find', '')}
+Topic: {problem.get('topic', '')}
+
+THE STEP THEY'RE STUCK ON:
+{step_text}
+
+{"THEIR ATTEMPT SO FAR: " + student_attempt if student_attempt else "They haven't written anything yet."}
+
+Give a HINT that helps them think through this step WITHOUT giving the answer directly.
+Your hint should:
+- Point them to the right physics concept or equation
+- Ask a guiding question that leads to the answer
+- Reference specific values from the problem they should use
+- Be encouraging and supportive
+
+Keep your hint to 2-3 sentences maximum. Be specific to THIS problem, not generic.
+
+Respond with ONLY valid JSON (no markdown, no backticks):
+{{
+  "hint": "<your hint text>",
+  "concept": "<the key physics concept for this step>"
+}}"""
+
+        if not ANTHROPIC_API_KEY:
+            return jsonify({"hint": "Think about what physics principle applies to this step. What equation connects the given values?", "concept": ""}), 200
+        
+        response_text = call_anthropic_api(hint_prompt, max_tokens=400)
+        clean = response_text.strip()
+        if clean.startswith('```'): clean = '\n'.join(clean.split('\n')[1:-1])
+        result = json.loads(clean)
+        
+        return jsonify({
+            "hint": result.get("hint", "Think about what equation applies here."),
+            "concept": result.get("concept", "")
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] step-hint: {e}")
+        return jsonify({"hint": "Try to identify which physics equation connects the values given in this step.", "concept": ""}), 200
+
+
 @app.get("/steps/<problem_id>")
 def get_steps(problem_id: str):
     try:

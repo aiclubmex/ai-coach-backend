@@ -108,7 +108,8 @@ CORS(app, resources={
 # Simple in-memory cache (avoids hammering Notion on repeated loads)
 # ==============================
 _cache = {}
-CACHE_TTL = 60  # seconds
+CACHE_TTL = 60  # seconds (default for most caches)
+PROBLEMS_CACHE_TTL = 1800  # 30 minutes for problems (they rarely change)
 
 def cache_get(key):
     """Get cached value if not expired."""
@@ -122,9 +123,13 @@ def cache_set(key, data):
     _cache[key] = {"data": data, "time": time.time()}
 
 def cache_clear(prefix=""):
-    """Clear cache entries matching prefix."""
+    """Clear cache entries matching prefix. Never clears problems cache (use /api/refresh-problems)."""
     if not prefix:
+        # Save problems cache and restore after clear
+        problems_cache = _cache.get("all-problems")
         _cache.clear()
+        if problems_cache:
+            _cache["all-problems"] = problems_cache
     else:
         keys_to_remove = [k for k in _cache if k.startswith(prefix)]
         for k in keys_to_remove:
@@ -485,8 +490,33 @@ def index(): return jsonify({"status": "ok", "service": "ai-coach-backend", "ver
 @app.get("/problems")
 def list_problems():
     try:
+        # Check cache first (30 min TTL — problems rarely change)
+        cached = _cache.get("all-problems")
+        if cached and time.time() - cached["time"] < PROBLEMS_CACHE_TTL:
+            return jsonify({"problems": cached["data"], "cached": True})
+        
         items = query_database(NOTION_DB_ID)
-        return jsonify({"problems": items})
+        
+        # Cache the results
+        _cache["all-problems"] = {"data": items, "time": time.time()}
+        
+        return jsonify({"problems": items, "cached": False})
+    except Exception as e: return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/refresh-problems")
+def refresh_problems():
+    """Force refresh the problems cache. Call after adding/editing problems in Notion."""
+    try:
+        # Clear problems cache
+        if "all-problems" in _cache:
+            del _cache["all-problems"]
+        
+        # Reload from Notion
+        items = query_database(NOTION_DB_ID)
+        _cache["all-problems"] = {"data": items, "time": time.time()}
+        
+        return jsonify({"success": True, "count": len(items), "message": f"Refreshed {len(items)} problems"})
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 @app.get("/problem/<problem_id>")

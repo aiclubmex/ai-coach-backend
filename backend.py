@@ -38,6 +38,7 @@ USERS_DB_ID         = os.environ.get("USERS_DB_ID", "")
 ACTIVITY_DB_ID      = os.environ.get("ACTIVITY_DB_ID", "")
 HOMEWORK_DB_ID      = os.environ.get("HOMEWORK_DB_ID", "")
 RESOURCES_DB_ID     = os.environ.get("RESOURCES_DB_ID", "")  # Resources by Topic
+GENERATED_DB_ID      = os.environ.get("GENERATED_DB_ID", "33537e6af8d981bea1adc213a13c3f8c")  # Agent 2 generated problems
 JWT_SECRET_KEY      = os.environ.get("JWT_SECRET_KEY", "change-this-secret-key-in-production")
 
 # ==============================
@@ -494,29 +495,64 @@ def list_problems():
         cached = _cache.get("all-problems")
         if cached and time.time() - cached["time"] < PROBLEMS_CACHE_TTL:
             return jsonify({"problems": cached["data"], "cached": True})
-        
-        items = query_database(NOTION_DB_ID)
-        
-        # Cache the results
+
+        # Fetch real exam problems
+        real_items = query_database(NOTION_DB_ID)
+        for p in real_items:
+            p["is_generated"] = False
+
+        # Fetch AI-generated problems (Agent 2 output)
+        generated_items = []
+        if GENERATED_DB_ID:
+            try:
+                generated_items = query_database(GENERATED_DB_ID)
+                for p in generated_items:
+                    p["is_generated"] = True
+            except Exception as gen_err:
+                print(f"[WARNING] Could not fetch generated problems: {gen_err}")
+
+        items = real_items + generated_items
+        print(f"[PROBLEMS] Loaded {len(real_items)} real + {len(generated_items)} generated = {len(items)} total")
+
+        # Cache the combined results
         _cache["all-problems"] = {"data": items, "time": time.time()}
-        
+
         return jsonify({"problems": items, "cached": False})
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 
 @app.get("/api/refresh-problems")
 def refresh_problems():
-    """Force refresh the problems cache. Call after adding/editing problems in Notion."""
+    """Force refresh the problems cache. Reloads from both real and generated DBs."""
     try:
-        # Clear problems cache
         if "all-problems" in _cache:
             del _cache["all-problems"]
-        
-        # Reload from Notion
-        items = query_database(NOTION_DB_ID)
+
+        # Reload real exam problems
+        real_items = query_database(NOTION_DB_ID)
+        for p in real_items:
+            p["is_generated"] = False
+
+        # Reload AI-generated problems
+        generated_items = []
+        if GENERATED_DB_ID:
+            try:
+                generated_items = query_database(GENERATED_DB_ID)
+                for p in generated_items:
+                    p["is_generated"] = True
+            except Exception as gen_err:
+                print(f"[WARNING] Could not fetch generated problems: {gen_err}")
+
+        items = real_items + generated_items
         _cache["all-problems"] = {"data": items, "time": time.time()}
-        
-        return jsonify({"success": True, "count": len(items), "message": f"Refreshed {len(items)} problems"})
+
+        return jsonify({
+            "success": True,
+            "count": len(items),
+            "real": len(real_items),
+            "generated": len(generated_items),
+            "message": f"Refreshed {len(real_items)} real + {len(generated_items)} generated = {len(items)} total"
+        })
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 @app.get("/problem/<problem_id>")
@@ -561,6 +597,21 @@ def problem_by_ref():
             page = fetch_page(results[0]["id"])
             return jsonify({"problem": page}), 200
         
+        # Fallback: search in Generated DB (Agent 2 output)
+        if GENERATED_DB_ID:
+            try:
+                gen_results = query_database(
+                    GENERATED_DB_ID,
+                    filter_obj={"property": "problem_reference", "rich_text": {"equals": ref}},
+                    max_pages=1
+                )
+                if gen_results:
+                    page = fetch_page(gen_results[0]["id"])
+                    page["is_generated"] = True
+                    return jsonify({"problem": page}), 200
+            except Exception:
+                pass
+
         return jsonify({"error": f"Problem with reference '{ref}' not found"}), 404
     except Exception as e:
         print(f"[ERROR] problem-by-ref: {e}")

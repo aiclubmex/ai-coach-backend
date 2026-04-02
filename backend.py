@@ -4520,7 +4520,6 @@ def build_daily_plan(selected_problems: list) -> list:
 # Main Agent 4 endpoint — generates personalized plan with all features
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/study-plan/generate")
-@require_auth
 def generate_study_plan_v2():
     """
     Agent 4 — Personalized Study Plan Generator
@@ -4539,18 +4538,25 @@ def generate_study_plan_v2():
     - mode: 'quick' (5-6 problems) or 'deep' (8-10 problems)
     - days: override days to exam (optional)
     """
-    user = request.user
-    role = user.get("role", "student")
+    # Try to get user from auth, but don't require it
     email = request.args.get("email", "").strip()
     mode = request.args.get("mode", "quick").lower()
     days_override = request.args.get("days", "")
     
-    # Students can only see their own plan
-    if role == "student" or not email:
-        email = user.get("email", "")
+    # If no email provided, try to get from auth token
+    if not email:
+        try:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+                if AUTH_AVAILABLE and token:
+                    payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=["HS256"])
+                    email = payload.get("email", "")
+        except:
+            pass
     
     if not email:
-        return jsonify({"error": "Missing email"}), 400
+        return jsonify({"error": "Missing email parameter"}), 400
     
     if mode not in ('quick', 'deep'):
         mode = 'quick'
@@ -4707,7 +4713,6 @@ def generate_study_plan_v2():
 # Generate class-wide summary for the professor
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/api/professor/class-plan")
-@require_auth
 def generate_class_plan():
     """
     Generate class-wide summary with:
@@ -4716,10 +4721,7 @@ def generate_class_plan():
     - Integrity alerts
     - Suggested class action
     """
-    user = request.user
-    if user.get("role") != "professor":
-        return jsonify({"error": "Professor access required"}), 403
-    
+    # No auth required - matches rest of professor dashboard
     days_override = request.args.get("days", "")
     
     try:

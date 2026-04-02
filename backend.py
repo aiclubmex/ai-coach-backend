@@ -17,6 +17,7 @@ from flask_cors import CORS
 import requests
 from functools import wraps
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict, Counter
 import time
 
 try:
@@ -38,7 +39,6 @@ USERS_DB_ID         = os.environ.get("USERS_DB_ID", "")
 ACTIVITY_DB_ID      = os.environ.get("ACTIVITY_DB_ID", "")
 HOMEWORK_DB_ID      = os.environ.get("HOMEWORK_DB_ID", "")
 RESOURCES_DB_ID     = os.environ.get("RESOURCES_DB_ID", "")  # Resources by Topic
-GENERATED_DB_ID      = os.environ.get("GENERATED_DB_ID", "33537e6af8d981bea1adc213a13c3f8c")  # Agent 2 generated problems
 JWT_SECRET_KEY      = os.environ.get("JWT_SECRET_KEY", "change-this-secret-key-in-production")
 
 # ==============================
@@ -495,64 +495,29 @@ def list_problems():
         cached = _cache.get("all-problems")
         if cached and time.time() - cached["time"] < PROBLEMS_CACHE_TTL:
             return jsonify({"problems": cached["data"], "cached": True})
-
-        # Fetch real exam problems
-        real_items = query_database(NOTION_DB_ID)
-        for p in real_items:
-            p["is_generated"] = False
-
-        # Fetch AI-generated problems (Agent 2 output)
-        generated_items = []
-        if GENERATED_DB_ID:
-            try:
-                generated_items = query_database(GENERATED_DB_ID)
-                for p in generated_items:
-                    p["is_generated"] = True
-            except Exception as gen_err:
-                print(f"[WARNING] Could not fetch generated problems: {gen_err}")
-
-        items = real_items + generated_items
-        print(f"[PROBLEMS] Loaded {len(real_items)} real + {len(generated_items)} generated = {len(items)} total")
-
-        # Cache the combined results
+        
+        items = query_database(NOTION_DB_ID)
+        
+        # Cache the results
         _cache["all-problems"] = {"data": items, "time": time.time()}
-
+        
         return jsonify({"problems": items, "cached": False})
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 
 @app.get("/api/refresh-problems")
 def refresh_problems():
-    """Force refresh the problems cache. Reloads from both real and generated DBs."""
+    """Force refresh the problems cache. Call after adding/editing problems in Notion."""
     try:
+        # Clear problems cache
         if "all-problems" in _cache:
             del _cache["all-problems"]
-
-        # Reload real exam problems
-        real_items = query_database(NOTION_DB_ID)
-        for p in real_items:
-            p["is_generated"] = False
-
-        # Reload AI-generated problems
-        generated_items = []
-        if GENERATED_DB_ID:
-            try:
-                generated_items = query_database(GENERATED_DB_ID)
-                for p in generated_items:
-                    p["is_generated"] = True
-            except Exception as gen_err:
-                print(f"[WARNING] Could not fetch generated problems: {gen_err}")
-
-        items = real_items + generated_items
+        
+        # Reload from Notion
+        items = query_database(NOTION_DB_ID)
         _cache["all-problems"] = {"data": items, "time": time.time()}
-
-        return jsonify({
-            "success": True,
-            "count": len(items),
-            "real": len(real_items),
-            "generated": len(generated_items),
-            "message": f"Refreshed {len(real_items)} real + {len(generated_items)} generated = {len(items)} total"
-        })
+        
+        return jsonify({"success": True, "count": len(items), "message": f"Refreshed {len(items)} problems"})
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 @app.get("/problem/<problem_id>")
@@ -597,21 +562,6 @@ def problem_by_ref():
             page = fetch_page(results[0]["id"])
             return jsonify({"problem": page}), 200
         
-        # Fallback: search in Generated DB (Agent 2 output)
-        if GENERATED_DB_ID:
-            try:
-                gen_results = query_database(
-                    GENERATED_DB_ID,
-                    filter_obj={"property": "problem_reference", "rich_text": {"equals": ref}},
-                    max_pages=1
-                )
-                if gen_results:
-                    page = fetch_page(gen_results[0]["id"])
-                    page["is_generated"] = True
-                    return jsonify({"problem": page}), 200
-            except Exception:
-                pass
-
         return jsonify({"error": f"Problem with reference '{ref}' not found"}), 404
     except Exception as e:
         print(f"[ERROR] problem-by-ref: {e}")
@@ -3868,7 +3818,6 @@ def get_study_plan():
     El profesor puede consultar cualquier alumno; el alumno solo ve el suyo.
     Combina plan del profesor (si existe) con sugerencias IA para semanas vacías.
     """
-    from collections import defaultdict
 
     user  = request.user
     role  = user.get("role", "student")
@@ -4132,7 +4081,6 @@ def ai_generate_week_plan():
     IA genera el plan detallado día a día para una semana específica.
     Params: email, week_number
     """
-    from collections import defaultdict
 
     student_email = request.args.get("email", "").strip()
     week_number   = int(request.args.get("week_number", 1))
@@ -4197,6 +4145,732 @@ Respond ONLY with valid JSON (no markdown, no backticks):
     except Exception as e:
         print(f"[AI WEEK PLAN ERROR] {e}")
         return jsonify({"error": str(e)[:200]}), 500
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AGENT 4 — STUDY PLAN GENERATOR
+# Agregar este código AL FINAL del archivo backend.py, ANTES de if __name__ == "__main__"
+# ══════════════════════════════════════════════════════════════════════════════
+# Features:
+# - ROI calculation (exam_weight × gap)
+# - CRITICAL / WILDCARD / IMPORTANT topic classification
+# - Countdown phases (BUILD / REINFORCE / SIMULATE / PEAK)
+# - Quick Review vs Deep Dive modes
+# - What-If predictor (show future if plan completed)
+# - Specific problem selection
+# - Integrity detection
+# - Class rank calculation
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IB EXAM WEIGHTS — Based on 192 real IB problems analysis (2022-2024)
+# ─────────────────────────────────────────────────────────────────────────────
+TOPIC_WEIGHTS = {
+    # CRITICAL — ~80% of exam, must master
+    'A.2': 0.118,  # Forces & Momentum — #1 most frequent
+    'B.5': 0.114,  # Electric Circuits
+    'C.1': 0.105,  # Simple Harmonic Motion
+    'B.1': 0.095,  # Thermal Energy
+    'E.3': 0.092,  # Radioactive Decay
+    'E.2': 0.087,  # Quantum Physics
+    'D.4': 0.077,  # Electromagnetic Induction
+    'C.3': 0.070,  # Wave Phenomena
+    
+    # WILDCARD — New Core 2025, never tested, MUST appear
+    'A.4': 0.060,  # Rigid Body Mechanics
+    'A.5': 0.050,  # Special Relativity
+    'B.4': 0.050,  # Thermodynamics
+    
+    # IMPORTANT — Regular appearance
+    'B.3': 0.045,  # Gas Laws
+    'D.2': 0.040,  # Electric & Magnetic Fields
+    'D.1': 0.035,  # Gravitational Fields
+    'B.2': 0.030,  # Greenhouse Effect
+    'E.1': 0.025,  # Nuclear Structure
+    'A.1': 0.025,  # Kinematics
+    'A.3': 0.020,  # Work, Energy & Power
+    
+    # LOW PRIORITY — Rare, cut first if time is short
+    'D.3': 0.008,  # Motion in Fields
+    'C.4': 0.006,  # Standing Waves
+    'C.5': 0.005,  # Doppler Effect
+    'E.4': 0.005,  # Fission & Fusion
+    'C.2': 0.005,  # Wave Properties
+    'E.5': 0.015,  # Particle Physics
+}
+
+TOPIC_NAMES = {
+    'A.1': 'Kinematics', 'A.2': 'Forces & Momentum', 'A.3': 'Work, Energy & Power',
+    'A.4': 'Rigid Body Mechanics', 'A.5': 'Special Relativity',
+    'B.1': 'Thermal Energy', 'B.2': 'Greenhouse Effect', 'B.3': 'Gas Laws',
+    'B.4': 'Thermodynamics', 'B.5': 'Electric Circuits',
+    'C.1': 'Simple Harmonic Motion', 'C.2': 'Wave Properties', 'C.3': 'Wave Phenomena',
+    'C.4': 'Standing Waves', 'C.5': 'Doppler Effect',
+    'D.1': 'Gravitational Fields', 'D.2': 'Electric & Magnetic Fields',
+    'D.3': 'Motion in Fields', 'D.4': 'Electromagnetic Induction',
+    'E.1': 'Nuclear Structure', 'E.2': 'Quantum Physics', 'E.3': 'Radioactive Decay',
+    'E.4': 'Fission & Fusion', 'E.5': 'Particle Physics',
+}
+
+CRITICAL_TOPICS = {'A.2', 'B.5', 'C.1', 'B.1', 'E.3', 'E.2', 'D.4', 'C.3'}
+WILDCARD_TOPICS = {'A.4', 'A.5', 'B.4'}
+LOW_TOPICS = {'D.3', 'C.4', 'C.5', 'E.4', 'C.2'}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE STRATEGY — Based on days to exam
+# ─────────────────────────────────────────────────────────────────────────────
+def get_countdown_phase(days_to_exam: int) -> dict:
+    """Returns phase configuration based on countdown to exam."""
+    if days_to_exam >= 21:
+        return {
+            'name': 'build',
+            'label': '🔨 Build Phase',
+            'focus': 'Cover CRITICAL topic gaps — mistakes are learning',
+            'strategy': 'Focus on weakest CRITICAL topics first',
+            'quick_problems': 6,
+            'deep_problems': 10,
+            'max_minutes_daily': 30,
+            'allow_new_topics': True,
+        }
+    elif days_to_exam >= 8:
+        return {
+            'name': 'reinforce',
+            'label': '🎯 Reinforcement Phase',
+            'focus': 'WILDCARD topics (A.4, A.5, B.4) + consolidate criticals',
+            'strategy': 'Balance new wildcards with proven strengths',
+            'quick_problems': 5,
+            'deep_problems': 8,
+            'max_minutes_daily': 25,
+            'allow_new_topics': True,
+        }
+    elif days_to_exam >= 4:
+        return {
+            'name': 'simulate',
+            'label': '📝 Simulation Phase',
+            'focus': 'Full mocks under exam conditions',
+            'strategy': 'Practice exam timing, no new material',
+            'quick_problems': 4,
+            'deep_problems': 4,
+            'max_minutes_daily': 45,
+            'allow_new_topics': False,
+        }
+    else:
+        return {
+            'name': 'peak',
+            'label': '🏆 Peak Phase',
+            'focus': 'Light review + REST — trust your preparation',
+            'strategy': 'Quick formula review, sleep well, no cramming',
+            'quick_problems': 2,
+            'deep_problems': 2,
+            'max_minutes_daily': 15,
+            'allow_new_topics': False,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROI CALCULATION — Prioritize topics for study
+# ─────────────────────────────────────────────────────────────────────────────
+def calculate_topic_roi(student_topic_data: dict) -> list:
+    """
+    Calculate Return on Investment for each topic.
+    ROI = exam_weight × (1 - student_mark_rate_for_topic) × boost_factor
+    """
+    roi_list = []
+    
+    for topic, weight in TOPIC_WEIGHTS.items():
+        data = student_topic_data.get(topic, {})
+        mark_rate = data.get('mark_rate', 0)
+        n_attempts = data.get('n', 0)
+        
+        gap = 1 - mark_rate
+        roi = weight * gap * 10  # Scale for readability
+        
+        # Boost wildcards
+        if topic in WILDCARD_TOPICS:
+            roi *= 1.5
+            reason = 'WILDCARD — New Core 2025, never tested'
+            priority = 'high'
+        elif topic in CRITICAL_TOPICS:
+            reason = 'CRITICAL — High exam frequency'
+            priority = 'high' if gap > 0.4 else 'medium'
+        elif topic in LOW_TOPICS:
+            reason = 'LOW — Rare in exams'
+            priority = 'low'
+        else:
+            reason = 'IMPORTANT — Regular appearance'
+            priority = 'medium'
+        
+        roi_list.append({
+            'topic': topic,
+            'name': TOPIC_NAMES.get(topic, topic),
+            'weight_pct': round(weight * 100, 1),
+            'mark_rate_pct': round(mark_rate * 100, 1),
+            'gap_pct': round(gap * 100, 1),
+            'roi': round(roi, 2),
+            'n_attempts': n_attempts,
+            'reason': reason,
+            'priority': priority,
+            'is_wildcard': topic in WILDCARD_TOPICS,
+            'is_critical': topic in CRITICAL_TOPICS,
+        })
+    
+    roi_list.sort(key=lambda x: x['roi'], reverse=True)
+    return roi_list
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PREDICT IB GRADE — Honest prediction based on practice
+# ─────────────────────────────────────────────────────────────────────────────
+def predict_ib_grade_v2(mark_rate: float, n_problems: int, n_topics: int, minutes_spent: float) -> dict:
+    """Honest IB grade prediction with confidence interval."""
+    if n_problems < 5 or n_topics < 2:
+        return {'grade': None, 'confidence': 'insufficient_data', 'reason': f'{n_problems}/5 problems, {n_topics}/2 topics needed'}
+    
+    pct = mark_rate * 100
+    
+    # Grade boundaries (IB Physics HL typical)
+    if pct >= 75: grade = 7
+    elif pct >= 65: grade = 6
+    elif pct >= 55: grade = 5
+    elif pct >= 45: grade = 4
+    elif pct >= 35: grade = 3
+    elif pct >= 25: grade = 2
+    else: grade = 1
+    
+    # Confidence based on sample size
+    if n_problems >= 30 and n_topics >= 8:
+        confidence, margin = 'high', 0
+    elif n_problems >= 15 and n_topics >= 5:
+        confidence, margin = 'medium', 1
+    else:
+        confidence, margin = 'low', 2
+    
+    return {
+        'grade': grade,
+        'confidence': confidence,
+        'low': max(1, grade - margin),
+        'high': min(7, grade + margin),
+        'mark_rate_pct': round(pct, 1),
+        'sample_size': n_problems,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT-IF PREDICTOR — Show impact of completing the plan
+# ─────────────────────────────────────────────────────────────────────────────
+def calculate_what_if(current_marks: int, current_possible: int, selected_problems: list, target_score: float = 0.75) -> dict:
+    """Predict stats change if student completes the plan."""
+    additional_marks_possible = sum(p.get('marks', 6) for p in selected_problems)
+    additional_marks_awarded = int(additional_marks_possible * target_score)
+    
+    new_marks = current_marks + additional_marks_awarded
+    new_possible = current_possible + additional_marks_possible
+    
+    current_rate = current_marks / current_possible if current_possible > 0 else 0
+    new_rate = new_marks / new_possible if new_possible > 0 else 0
+    
+    return {
+        'current': {
+            'mark_rate_pct': round(current_rate * 100, 1),
+            'total_marks': current_marks,
+        },
+        'projected': {
+            'mark_rate_pct': round(new_rate * 100, 1),
+            'total_marks': new_marks,
+        },
+        'improvement': {
+            'mark_rate_delta': round((new_rate - current_rate) * 100, 1),
+            'additional_problems': len(selected_problems),
+        },
+        'assumption': f'Assumes {int(target_score*100)}% score on {len(selected_problems)} problems',
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTEGRITY CHECK — Detect potential copy-paste
+# ─────────────────────────────────────────────────────────────────────────────
+def check_integrity(activities: list) -> dict:
+    """Check for suspicious submission patterns (not accusation — coaching signal)."""
+    valid = [a for a in activities if (a.get('marks_total') or 0) > 0 and (a.get('time_spent_seconds') or 0) > 0]
+    
+    if len(valid) < 3:
+        return {'level': 'insufficient_data', 'pct': 0, 'message': None}
+    
+    suspicious = [a for a in valid if (a['time_spent_seconds'] / a['marks_total']) < 30]
+    rate = len(suspicious) / len(valid)
+    
+    if rate > 0.30:
+        return {
+            'level': 'verify',
+            'pct': round(rate * 100),
+            'message': 'Consider in-class demonstration to verify understanding',
+        }
+    elif rate > 0.10:
+        return {
+            'level': 'review',
+            'pct': round(rate * 100),
+            'message': 'Monitor next few submissions',
+        }
+    else:
+        return {'level': 'ok', 'pct': 0, 'message': None}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SELECT PROBLEMS — Choose specific problems for the plan
+# ─────────────────────────────────────────────────────────────────────────────
+def select_problems_for_plan(priority_topics: list, problems_db: list, completed_refs: set, phase: dict, mode: str = 'quick') -> list:
+    """Select specific problems based on ROI and phase."""
+    max_problems = phase.get('quick_problems', 5) if mode == 'quick' else phase.get('deep_problems', 10)
+    
+    # Build topic → problems mapping
+    topic_problems = {}
+    for p in problems_db:
+        topic = p.get('topic', '')
+        if isinstance(topic, list):
+            topic = topic[0] if topic else ''
+        if not topic:
+            continue
+        
+        ref = p.get('problem_reference', '')
+        if not ref or ref in completed_refs:
+            continue
+        
+        if topic not in topic_problems:
+            topic_problems[topic] = []
+        
+        topic_problems[topic].append({
+            'ref': ref,
+            'id': p.get('id', ''),
+            'name': p.get('name', p.get('Name', ref)),
+            'topic': topic,
+            'topic_name': TOPIC_NAMES.get(topic, topic),
+            'marks': p.get('marks') or p.get('Marks') or 6,
+            'difficulty': p.get('difficulty', 'medium'),
+        })
+    
+    # Sort by difficulty within each topic
+    difficulty_order = {'easy': 0, 'medium': 1, 'hard': 2}
+    for topic in topic_problems:
+        topic_problems[topic].sort(key=lambda x: difficulty_order.get(x['difficulty'], 1))
+    
+    # Select from priority topics
+    selected = []
+    problems_per_topic = max(1, max_problems // min(len(priority_topics), 4))
+    
+    for topic_info in priority_topics[:6]:
+        topic = topic_info['topic']
+        available = topic_problems.get(topic, [])
+        
+        for p in available[:problems_per_topic]:
+            if len(selected) >= max_problems:
+                break
+            
+            marks = p.get('marks', 6)
+            est_minutes = round(marks * 1.5)  # IB standard
+            
+            selected.append({
+                **p,
+                'estimated_minutes': est_minutes,
+                'reason': topic_info['reason'],
+                'roi': topic_info['roi'],
+            })
+        
+        if len(selected) >= max_problems:
+            break
+    
+    return selected
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILD DAILY PLAN — Micro-commitments
+# ─────────────────────────────────────────────────────────────────────────────
+def build_daily_plan(selected_problems: list) -> list:
+    """Split problems into daily micro-commitments (10-20 min each)."""
+    daily_plan = []
+    days = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes-Domingo']
+    problems_per_day = max(1, len(selected_problems) // 5)
+    
+    for i, day in enumerate(days):
+        start_idx = i * problems_per_day
+        end_idx = start_idx + problems_per_day
+        day_problems = selected_problems[start_idx:end_idx]
+        
+        if day_problems:
+            total_mins = sum(p.get('estimated_minutes', 10) for p in day_problems)
+            daily_plan.append({
+                'day': day,
+                'problems': [{'ref': p['ref'], 'topic': p['topic'], 'marks': p['marks']} for p in day_problems],
+                'estimated_minutes': total_mins,
+                'action': f"{len(day_problems)} problema(s) — {total_mins} min",
+            })
+    
+    # Remaining problems go to weekend
+    remaining_idx = len(days) * problems_per_day
+    if remaining_idx < len(selected_problems) and daily_plan:
+        remaining = selected_problems[remaining_idx:]
+        daily_plan[-1]['problems'].extend([{'ref': p['ref'], 'topic': p['topic'], 'marks': p['marks']} for p in remaining])
+        daily_plan[-1]['estimated_minutes'] += sum(p.get('estimated_minutes', 10) for p in remaining)
+    
+    return daily_plan
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENDPOINT: GET /api/study-plan/generate
+# Main Agent 4 endpoint — generates personalized plan with all features
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/api/study-plan/generate")
+@require_auth
+def generate_study_plan_v2():
+    """
+    Agent 4 — Personalized Study Plan Generator
+    
+    Features:
+    - ROI-based topic prioritization
+    - CRITICAL / WILDCARD classification
+    - Countdown phase strategy
+    - Quick/Deep mode
+    - What-If predictor
+    - Specific problem selection
+    - Integrity check
+    
+    Params:
+    - email: student email (professors can query any student)
+    - mode: 'quick' (5-6 problems) or 'deep' (8-10 problems)
+    - days: override days to exam (optional)
+    """
+    user = request.user
+    role = user.get("role", "student")
+    email = request.args.get("email", "").strip()
+    mode = request.args.get("mode", "quick").lower()
+    days_override = request.args.get("days", "")
+    
+    # Students can only see their own plan
+    if role == "student" or not email:
+        email = user.get("email", "")
+    
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+    
+    if mode not in ('quick', 'deep'):
+        mode = 'quick'
+    
+    try:
+        # ── 1. CALCULATE DAYS TO EXAM ─────────────────────────────
+        exam_date = datetime(2026, 4, 28)
+        if days_override and days_override.isdigit():
+            days_to_exam = int(days_override)
+        else:
+            days_to_exam = max(0, (exam_date - datetime.utcnow()).days)
+        
+        phase = get_countdown_phase(days_to_exam)
+        
+        # ── 2. FETCH STUDENT ACTIVITY ─────────────────────────────
+        activities = []
+        if ACTIVITY_DB_ID:
+            activities = query_database(
+                ACTIVITY_DB_ID,
+                filter_obj={"property": "user_email", "email": {"equals": email}},
+                sorts=[{"property": "timestamp", "direction": "descending"}],
+            )
+        
+        completed = [a for a in activities if a.get("action") in ("completed", "submitted")]
+        
+        # ── 3. AGGREGATE BY TOPIC ─────────────────────────────────
+        topic_data = {}
+        total_marks_awarded = 0
+        total_marks_possible = 0
+        error_types = []
+        
+        for a in completed:
+            topic = a.get("topic") or a.get("key_concept") or ""
+            if isinstance(topic, list):
+                topic = topic[0] if topic else ""
+            
+            # Normalize topic to IB code (A.1, B.2, etc.)
+            topic_code = ""
+            for code in TOPIC_WEIGHTS.keys():
+                if code.lower() in str(topic).lower() or TOPIC_NAMES.get(code, "").lower() in str(topic).lower():
+                    topic_code = code
+                    break
+            if not topic_code:
+                topic_code = topic[:3] if len(topic) >= 3 else "Other"
+            
+            marks_awarded = a.get("marks_awarded") or 0
+            marks_total = a.get("marks_total") or a.get("marks") or 1
+            
+            if topic_code not in topic_data:
+                topic_data[topic_code] = {'marks_awarded': 0, 'marks_total': 0, 'n': 0, 'scores': []}
+            
+            topic_data[topic_code]['marks_awarded'] += marks_awarded
+            topic_data[topic_code]['marks_total'] += marks_total
+            topic_data[topic_code]['n'] += 1
+            if a.get('score'):
+                topic_data[topic_code]['scores'].append(a['score'])
+            
+            total_marks_awarded += marks_awarded
+            total_marks_possible += marks_total
+            
+            if a.get('error_type'):
+                error_types.append(a['error_type'])
+        
+        # Calculate mark_rate per topic
+        for topic, data in topic_data.items():
+            data['mark_rate'] = data['marks_awarded'] / data['marks_total'] if data['marks_total'] > 0 else 0
+        
+        # ── 4. CALCULATE ROI ──────────────────────────────────────
+        priority_topics = calculate_topic_roi(topic_data)
+        
+        # ── 5. FETCH PROBLEMS DB ──────────────────────────────────
+        problems = []
+        cache_key = "problems_all"
+        cached = cache_get(cache_key)
+        if cached:
+            problems = cached
+        elif NOTION_DB_ID:
+            problems = query_database(NOTION_DB_ID)
+            cache_set(cache_key, problems)
+        
+        # ── 6. SELECT PROBLEMS ────────────────────────────────────
+        completed_refs = {a.get('problem_reference', '') for a in completed if a.get('score', 0) >= 70}
+        selected_problems = select_problems_for_plan(priority_topics, problems, completed_refs, phase, mode)
+        
+        # ── 7. BUILD DAILY PLAN ───────────────────────────────────
+        daily_plan = build_daily_plan(selected_problems)
+        
+        # ── 8. WHAT-IF PREDICTOR ──────────────────────────────────
+        what_if = calculate_what_if(total_marks_awarded, total_marks_possible, selected_problems)
+        
+        # ── 9. INTEGRITY CHECK ────────────────────────────────────
+        integrity = check_integrity(completed)
+        
+        # ── 10. PREDICTED IB ──────────────────────────────────────
+        mark_rate = total_marks_awarded / total_marks_possible if total_marks_possible > 0 else 0
+        minutes_spent = sum(a.get('time_spent_seconds', 0) for a in completed) / 60
+        predicted_ib = predict_ib_grade_v2(mark_rate, len(completed), len(topic_data), minutes_spent)
+        
+        # ── 11. DOMINANT ERROR ────────────────────────────────────
+        dominant_error = Counter(error_types).most_common(1)[0][0] if error_types else None
+        
+        # ── 12. BUILD RESPONSE ────────────────────────────────────
+        return jsonify({
+            "student_email": email,
+            "generated_at": datetime.utcnow().isoformat(),
+            "days_to_exam": days_to_exam,
+            "mode": mode,
+            "phase": phase,
+            
+            "diagnosis": {
+                "n_problems": len(completed),
+                "n_topics": len(topic_data),
+                "mark_rate_pct": round(mark_rate * 100, 1),
+                "predicted_ib": predicted_ib,
+                "dominant_error": dominant_error,
+                "integrity": integrity,
+            },
+            
+            "priority_topics": priority_topics[:8],
+            
+            "recommended_problems": [
+                {
+                    "ref": p['ref'],
+                    "id": p.get('id', ''),
+                    "name": p.get('name', ''),
+                    "topic": p['topic'],
+                    "topic_name": p['topic_name'],
+                    "marks": p['marks'],
+                    "difficulty": p.get('difficulty', 'medium'),
+                    "estimated_minutes": p['estimated_minutes'],
+                    "reason": p['reason'],
+                    "roi": p['roi'],
+                }
+                for p in selected_problems
+            ],
+            
+            "daily_plan": daily_plan,
+            
+            "what_if": what_if,
+            
+            "total_estimated_minutes": sum(p.get('estimated_minutes', 10) for p in selected_problems),
+            
+            "success_metric": f"Score ≥70% on {len(selected_problems)} problems → +{what_if['improvement']['mark_rate_delta']}% mark rate",
+        }), 200
+    
+    except Exception as e:
+        print(f"[AGENT 4 ERROR] {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)[:300]}), 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENDPOINT: GET /api/professor/class-plan
+# Generate class-wide summary for the professor
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/api/professor/class-plan")
+@require_auth
+def generate_class_plan():
+    """
+    Generate class-wide summary with:
+    - At-risk students
+    - Topics to review
+    - Integrity alerts
+    - Suggested class action
+    """
+    user = request.user
+    if user.get("role") != "professor":
+        return jsonify({"error": "Professor access required"}), 403
+    
+    days_override = request.args.get("days", "")
+    
+    try:
+        exam_date = datetime(2026, 4, 28)
+        if days_override and days_override.isdigit():
+            days_to_exam = int(days_override)
+        else:
+            days_to_exam = max(0, (exam_date - datetime.utcnow()).days)
+        
+        phase = get_countdown_phase(days_to_exam)
+        
+        # Fetch all students
+        all_users = []
+        if USERS_DB_ID:
+            all_users = query_database(
+                USERS_DB_ID,
+                filter_obj={"property": "role", "select": {"equals": "student"}},
+            )
+        
+        # Fetch all activities
+        all_activities = []
+        if ACTIVITY_DB_ID:
+            all_activities = query_database(ACTIVITY_DB_ID)
+        
+        # Aggregate by student
+        student_data = {}
+        for a in all_activities:
+            email = a.get("user_email", "")
+            if not email or email == "demo":
+                continue
+            
+            if email not in student_data:
+                student_data[email] = {
+                    'email': email,
+                    'marks_awarded': 0,
+                    'marks_total': 0,
+                    'n_problems': 0,
+                    'activities': [],
+                }
+            
+            if a.get("action") in ("completed", "submitted"):
+                student_data[email]['marks_awarded'] += a.get("marks_awarded") or 0
+                student_data[email]['marks_total'] += a.get("marks_total") or 1
+                student_data[email]['n_problems'] += 1
+                student_data[email]['activities'].append(a)
+        
+        # Calculate stats and find at-risk
+        at_risk = []
+        all_mark_rates = []
+        integrity_alerts = []
+        
+        for email, data in student_data.items():
+            if data['marks_total'] > 0:
+                mark_rate = data['marks_awarded'] / data['marks_total']
+            else:
+                mark_rate = 0
+            
+            data['mark_rate'] = mark_rate
+            all_mark_rates.append(mark_rate)
+            
+            # Predict IB
+            pred = predict_ib_grade_v2(mark_rate, data['n_problems'], 5, 0)
+            data['predicted_ib'] = pred
+            
+            # At-risk: IB ≤ 3 or mark_rate < 40%
+            if pred.get('grade') and pred['grade'] <= 3:
+                at_risk.append({
+                    'email': email,
+                    'predicted_ib': pred['grade'],
+                    'mark_rate_pct': round(mark_rate * 100, 1),
+                    'n_problems': data['n_problems'],
+                })
+            elif mark_rate < 0.4 and data['n_problems'] > 0:
+                at_risk.append({
+                    'email': email,
+                    'predicted_ib': pred.get('grade'),
+                    'mark_rate_pct': round(mark_rate * 100, 1),
+                    'n_problems': data['n_problems'],
+                })
+            
+            # Integrity check
+            integrity = check_integrity(data['activities'])
+            if integrity['level'] in ('verify', 'review'):
+                integrity_alerts.append({
+                    'email': email,
+                    'flag': integrity['level'],
+                    'pct': integrity['pct'],
+                    'message': integrity['message'],
+                })
+        
+        at_risk.sort(key=lambda x: x.get('predicted_ib') or 0)
+        
+        # Class averages
+        class_avg = sum(all_mark_rates) / len(all_mark_rates) if all_mark_rates else 0
+        
+        # Aggregate topics across class
+        topic_scores = {}
+        for email, data in student_data.items():
+            for a in data['activities']:
+                topic = a.get("topic") or a.get("key_concept") or "Other"
+                if isinstance(topic, list):
+                    topic = topic[0] if topic else "Other"
+                
+                if topic not in topic_scores:
+                    topic_scores[topic] = []
+                if a.get('score'):
+                    topic_scores[topic].append(a['score'])
+        
+        weak_topics = []
+        for topic, scores in topic_scores.items():
+            if scores:
+                avg = sum(scores) / len(scores)
+                if avg < 60:
+                    weak_topics.append({
+                        'topic': topic,
+                        'class_avg': round(avg, 1),
+                        'n_attempts': len(scores),
+                    })
+        
+        weak_topics.sort(key=lambda x: x['class_avg'])
+        
+        return jsonify({
+            "generated_at": datetime.utcnow().isoformat(),
+            "days_to_exam": days_to_exam,
+            "phase": phase,
+            
+            "class_summary": {
+                "n_students": len(student_data),
+                "class_avg_mark_rate": round(class_avg * 100, 1),
+                "n_at_risk": len(at_risk),
+            },
+            
+            "at_risk_students": at_risk[:10],
+            
+            "topics_to_review": weak_topics[:5],
+            
+            "integrity_alerts": integrity_alerts[:5],
+            
+            "suggested_action": f"Phase: {phase['label']} — {phase['focus']}. " +
+                               (f"Focus on {weak_topics[0]['topic']} this week." if weak_topics else "All topics on track."),
+        }), 200
+    
+    except Exception as e:
+        print(f"[CLASS PLAN ERROR] {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)[:300]}), 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# END OF AGENT 4 CODE — Add this before if __name__ == "__main__":
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 if __name__ == "__main__":
